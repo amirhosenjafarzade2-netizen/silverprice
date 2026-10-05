@@ -1,16 +1,19 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v3.1
+Silver Macro Environment Analyzer (Streamlit), v3.2
 
-Which macro environments have been historically favorable / unfavorable for silver, what regime are we in,
+Which macro environments have been historically favorable / unfavorable for silver (and gold), what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
 
 requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn
 Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access.
 Educational only, not financial advice.
 
-v3.1 changes:
-- All downloads (Yahoo + 8 FRED series) run in parallel in one cached function.
-- Progress callbacks removed from @st.cache_data functions (fixes CacheReplayClosureError).
+v3.2 changes:
+- New tab: indicator ranking (which indicators predict best, in %, learn vs unseen data, by horizon).
+- Backtest: 9 strategies (incl. gold rotation and trend filters), 3 signal sources, and a
+  "find the best strategy" leaderboard with a first-half / second-half honesty check.
+- New final tab: silver, gold and silver-vs-gold verdict for the current environment.
+v3.1: parallel downloads; no progress callbacks inside cached functions.
 """
 import io
 import os
@@ -41,6 +44,26 @@ ML_MODELS = ["Logistic regression", "Random Forest", "Gradient Boosting"]
 TARGETS = {"Silver's return": "ret", "Silver minus gold (relative)": "gold", "Silver minus cash (T-bills)": "cash"}
 PILLARS = ["Monetary", "Dollar", "Industrial", "Liquidity & risk", "Gold & valuation"]
 STATES = ["Low", "Mid", "High"]
+
+STRATEGIES = [
+    "Scaled: 100% / 50% / 0%",
+    "Defensive: 100% / 25% / 0%",
+    "Aggressive: 100% / 75% / 25%",
+    "Only when Favorable",
+    "Hold unless Unfavorable",
+    "Rotate: silver if Favorable, else gold",
+    "Silver / gold / cash: Fav / Neutral / Unfav",
+    "Trend only: silver above its 10-month average",
+    "Macro + trend: not Unfavorable and above 10-month average",
+]
+NO_SIGNAL = {STRATEGIES[7]}  # strategies that ignore the macro signal
+RANK_METRICS = ["Sharpe", "Sortino", "CAGR", "Calmar", "Max drawdown"]
+NOW_KINDS = ("ret", "goldabs", "gold")
+NOW_NAMES = {"ret": "Silver", "goldabs": "Gold", "gold": "Silver vs gold"}
+NOW_PHRASE = {"ret": "silver is higher", "goldabs": "gold is higher", "gold": "silver beats gold"}
+REL_TXT = {"Favorable": "Favors silver over gold", "Leaning favorable": "Leans toward silver",
+           "Neutral": "No clear preference", "Leaning unfavorable": "Leans toward gold",
+           "Unfavorable": "Favors gold over silver"}
 
 # indicator -> (title, label when LOW, label when HIGH, is a % change?, pillar)
 META_ALL = {
@@ -91,8 +114,16 @@ def show_plot(box, f):
         box.plotly_chart(f, use_container_width=True)
 
 
+def card(box):
+    """Bordered container on new Streamlit, plain container on old versions."""
+    try:
+        return box.container(border=True)
+    except TypeError:
+        return box.container()
+
+
 def state_label(col, state):
-    return {"Low": META[col][1], "Mid": "Neutral", "High": META[col][2]}[state]
+    return {"Low": META_ALL[col][1], "Mid": "Neutral", "High": META_ALL[col][2]}[state]
 
 
 # ------------------------------------------------------------------ data
@@ -344,6 +375,13 @@ def pc(v, plus=True):
     return "-" if pd.isna(v) else (f"{v:+.1%}" if plus else f"{v:.0%}")
 
 
+def fm(metric, v):
+    """Format a performance metric by name."""
+    if pd.isna(v):
+        return "-"
+    return f"{v:.2f}" if metric in ("Sharpe", "Sortino", "Calmar") else pc(v)
+
+
 def fmt_summary(d, dd=False):
     o = pd.DataFrame({"Environment": d["Group"], "Months": d["Months"], "Avg after": d["Avg"].map(pc),
                       "95% CI": [("-" if pd.isna(a) else f"{a:+.0%} to {b:+.0%}") for a, b in zip(d["lo"], d["hi"])],
@@ -360,6 +398,9 @@ def cash_rate(m):
 
 
 def target_returns(m, idx, h, kind):
+    """kind: ret = silver return, gold = silver minus gold, cash = silver minus T-bills, goldabs = gold return."""
+    if kind == "goldabs":
+        return (m["gold"].shift(-h) / m["gold"] - 1).reindex(idx)
     s = m["silver"].shift(-h) / m["silver"] - 1
     if kind == "gold":
         s = s - (m["gold"].shift(-h) / m["gold"] - 1)
@@ -396,6 +437,55 @@ def rank_ic(a, b):
     if len(d) < 8 or d.iloc[:, 0].nunique() < 2:
         return np.nan
     return d.iloc[:, 0].rank().corr(d.iloc[:, 1].rank())
+
+
+# ------------------------------------------------------------------ indicator ranking
+def hl_spread(fwd, S, c, idx):
+    """Average outcome when the indicator is HIGH minus when it is LOW, in percentage points."""
+    r, s = fwd.loc[idx], S.loc[idx, c]
+    hi, lo = r[s == "High"], r[s == "Low"]
+    return (hi.mean() - lo.mean()) * 100 if len(hi) >= 4 and len(lo) >= 4 else np.nan
+
+
+def indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h):
+    """Rank-correlation of each indicator with the future outcome, on learn and on unseen (test) data."""
+    rows = []
+    for c in F_ok.columns:
+        xl, yl = F_ok.loc[learn_idx, c], fwd.loc[learn_idx]
+        xt, yt = F_ok.loc[test_idx, c], fwd.loc[test_idx]
+        ic_l, ic_t = rank_ic(xl, yl), rank_ic(xt, yt)
+        t_l = nw_t(yl.rank().values, xl.rank().values, h) if len(xl) > 8 else np.nan
+        hit = np.nan
+        if pd.notna(ic_l) and ic_l != 0 and len(xt) >= 8:
+            sx = np.sign(xt - xl.median()) * np.sign(ic_l)
+            sy = np.sign(yt - yl.median())
+            ok = (sx != 0) & (sy != 0)
+            hit = float((sx[ok] == sy[ok]).mean()) if ok.sum() >= 8 else np.nan
+        same = bool(pd.notna(ic_l) and pd.notna(ic_t) and np.sign(ic_l) == np.sign(ic_t))
+        reliab = min(abs(ic_l), abs(ic_t)) * 100 if same else 0.0
+        if pd.isna(ic_l) or pd.isna(ic_t):
+            status = "-"
+        elif not same:
+            status = "❌ Flips on unseen data"
+        elif abs(t_l) >= 2:
+            status = "✅ Reliable"
+        else:
+            status = "🟡 Weak but consistent"
+        rows.append(dict(col=c, ic_l=ic_l, ic_t=ic_t, t_l=t_l, hit=hit, reliab=reliab, status=status,
+                         hl_l=hl_spread(fwd, S, c, learn_idx), hl_t=hl_spread(fwd, S, c, test_idx)))
+    d = pd.DataFrame(rows)
+    d["absl"] = d["ic_l"].abs()
+    return d.sort_values(["reliab", "absl"], ascending=False, na_position="last").drop(columns="absl").reset_index(drop=True)
+
+
+def ic_by_horizon(m, F_ok, target, learn_frac):
+    """Rank correlation (learn period only) of each indicator with the outcome at every look-ahead."""
+    out = {}
+    for h_ in HORIZONS:
+        fwd_ = target_returns(m, F_ok.index, h_, target)
+        _, _, learn_, _ = split_idx(F_ok, fwd_, h_, learn_frac)
+        out[h_] = {c: rank_ic(F_ok.loc[learn_, c], fwd_.loc[learn_]) for c in F_ok.columns}
+    return pd.DataFrame(out)
 
 
 # ------------------------------------------------------------------ machine learning
@@ -530,34 +620,159 @@ def streak_info(v, fwd, ev):
     return cur, int(run.iloc[-1]), med, len(r), (r.mean() if len(r) else np.nan)
 
 
+# ------------------------------------------------------------------ current verdict for silver / gold
+def exposure_label(e):
+    """Average of the rules and ML views (each 0 / 0.5 / 1) -> five-step label."""
+    if e >= 0.99:
+        return "Favorable", "🟢"
+    if e >= 0.7:
+        return "Leaning favorable", "🟡"
+    if e > 0.3:
+        return "Neutral", "⚪"
+    if e > 0.01:
+        return "Leaning unfavorable", "🟠"
+    return "Unfavorable", "🔴"
+
+
+@st.cache_data(show_spinner=False)
+def analyse_target(kind, m, F_ok, h, learn_frac, t_thr, need_consistent, run_ml, ml_choice, step, margin):
+    """Full rules + ML read of the CURRENT month for one target. No Streamlit calls inside."""
+    fwd_ = target_returns(m, F_ok.index, h, kind)
+    ev_, cut_, learn_, test_ = split_idx(F_ok, fwd_, h, learn_frac)
+    S_, stats_, good_, bad_, score_, verdict_ = run_rules(F_ok, fwd_, learn_, h, t_thr, need_consistent)
+    now_ = F_ok.index[-1]
+    v_r, S_now = verdict_.loc[now_], S_.loc[now_]
+    res = dict(rules=v_r, score=int(score_.loc[now_]),
+               why_good=[state_label(c, s_) for c, s_ in sorted(good_) if S_now[c] == s_],
+               why_bad=[state_label(c, s_) for c, s_ in sorted(bad_) if S_now[c] == s_])
+
+    # out-of-sample evidence for the rules
+    sp, ev_level = np.nan, "Unknown"
+    ev_text = "Not enough Favorable and Unfavorable months in the unseen period to judge."
+    if not (good_ or bad_):
+        ev_level, ev_text = "None", "No environment passed the strength filter, so the rules have no opinion."
+    else:
+        ts = summarize(fwd_, verdict_, test_, h).set_index("Group")
+        if ts.loc[FAV, "Months"] >= 3 and ts.loc[UNF, "Months"] >= 3:
+            sp = (ts.loc[FAV, "Avg"] - ts.loc[UNF, "Avg"]) * 100
+            lo_f, hi_u = ts.loc[FAV, "lo"], ts.loc[UNF, "hi"]
+            overlap = bool(pd.isna(lo_f) or pd.isna(hi_u) or lo_f <= hi_u)
+            if sp > 2 and not overlap:
+                ev_level, ev_text = "Strong", f"Unseen data: Favorable beat Unfavorable by {sp:.1f} pts, confidence ranges do not overlap."
+            elif sp > 0:
+                ev_level, ev_text = "Weak", f"Unseen data: Favorable beat Unfavorable by {sp:.1f} pts, but the ranges overlap (could be noise)."
+            else:
+                ev_level, ev_text = "None", f"Unseen data: Favorable did NOT beat Unfavorable ({sp:+.1f} pts)."
+    res.update(ev_level=ev_level, ev_text=ev_text, spread=sp)
+
+    # machine learning
+    ml_info = None
+    if run_ml:
+        Fev_, fev_ = F_ok.loc[ev_], fwd_.loc[ev_]
+        wf_ = walk_forward(Fev_, fev_, h, cut_, step, ml_choice)
+        p_, base_, _, _ = fit_today(Fev_, fev_, F_ok.iloc[-1], ml_choice)
+        dm = p_ - base_
+        auc = bss = np.nan
+        if not wf_.empty:
+            yy = (fwd_.loc[wf_.index] > 0).astype(int)
+            if yy.nunique() > 1:
+                auc = roc_auc_score(yy, wf_["p"])
+                _, bss, _ = prob_metrics(wf_, yy)
+        ml_info = dict(p=p_, base=base_, verdict=FAV if dm >= margin else (UNF if dm <= -margin else NEU), auc=auc, bss=bss)
+    res["ml"] = ml_info
+
+    e = float(np.mean([EXPO[v_r]] + ([EXPO[ml_info["verdict"]]] if ml_info else [])))
+    res["e"] = e
+    res["label"], res["icon"] = exposure_label(e)
+    a = analogues(F_ok, fwd_, ev_, F_ok.iloc[-1], h)["After"]
+    res["ana_med"], res["ana_pos"] = float(a.median()), float((a > 0).mean())
+    return res
+
+
 # ------------------------------------------------------------------ backtest
-def exposure_from(v, mode):
-    if mode.startswith("Only"):
-        return (v == FAV).astype(float)
-    if mode.startswith("Hold"):
-        return (v != UNF).astype(float)
-    return v.map(EXPO).astype(float)
+def strategy_weights(name, v, trend):
+    """Weights (silver, gold, cash) held during the month AFTER each signal month."""
+    z = pd.Series(0.0, index=v.index)
+    s, g = z.copy(), z.copy()
+    fav, unf = v == FAV, v == UNF
+    if name.startswith("Scaled"):
+        s = v.map(EXPO).astype(float)
+    elif name.startswith("Defensive"):
+        s = v.map({FAV: 1.0, NEU: 0.25, UNF: 0.0}).astype(float)
+    elif name.startswith("Aggressive"):
+        s = v.map({FAV: 1.0, NEU: 0.75, UNF: 0.25}).astype(float)
+    elif name.startswith("Only when"):
+        s = fav.astype(float)
+    elif name.startswith("Hold unless"):
+        s = (~unf).astype(float)
+    elif name.startswith("Rotate"):
+        s, g = fav.astype(float), (~fav).astype(float)
+    elif name.startswith("Silver / gold"):
+        s, g = fav.astype(float), (v == NEU).astype(float)
+    elif name.startswith("Trend only"):
+        s = trend.astype(float)
+    elif name.startswith("Macro + trend"):
+        s = ((~unf) & trend).astype(float)
+    return pd.DataFrame({"silver": s, "gold": g, "cash": 1.0 - s - g})
 
 
-def run_backtest(m, expo, bps):
+def _contrib(w, r):
+    return pd.Series(np.where(w.values == 0, 0.0, w.values * r.values), index=w.index)
+
+
+def run_backtest_w(m, W, bps):
     """Signal at month-end t sets the position held during month t -> t+1. Costs charged on turnover."""
-    r = m["silver"].pct_change().shift(-1).reindex(expo.index)
-    rf = cash_rate(m).reindex(expo.index)
-    turn = expo.diff().abs()
-    turn.iloc[0] = expo.iloc[0]
-    return (expo * r + (1 - expo) * rf - turn * bps / 1e4).dropna(), turn
+    rs = m["silver"].pct_change().shift(-1).reindex(W.index)
+    rg = m["gold"].pct_change().shift(-1).reindex(W.index)
+    rf = cash_rate(m).reindex(W.index)
+    turn = W["silver"].diff().abs() + W["gold"].diff().abs()
+    turn.iloc[0] = W["silver"].iloc[0] + W["gold"].iloc[0]
+    ret = _contrib(W["silver"], rs) + _contrib(W["gold"], rg) + _contrib(W["cash"], rf) - turn * bps / 1e4
+    return ret.dropna(), turn
 
 
 def perf(r, rf, invested=np.nan, trades=np.nan):
+    keys = ["CAGR", "Volatility", "Sharpe", "Sortino", "Calmar", "Max drawdown"]
     n = len(r)
+    if n < 2:
+        out = dict.fromkeys(keys, np.nan)
+        out.update({"% invested": invested, "Trades": trades})
+        return out
     eq = (1 + r).cumprod()
     ex = r - rf.reindex(r.index).fillna(0)
     vol = r.std() * np.sqrt(12)
     dn = np.sqrt((np.minimum(ex, 0) ** 2).mean()) * np.sqrt(12)
-    return {"CAGR": eq.iloc[-1] ** (12 / n) - 1, "Volatility": vol,
+    cagr = eq.iloc[-1] ** (12 / n) - 1
+    mdd = (eq / eq.cummax() - 1).min()
+    return {"CAGR": cagr, "Volatility": vol,
             "Sharpe": ex.mean() * 12 / vol if vol > 0 else np.nan,
             "Sortino": ex.mean() * 12 / dn if dn > 0 else np.nan,
-            "Max drawdown": (eq / eq.cummax() - 1).min(), "% invested": invested, "Trades": trades}
+            "Calmar": cagr / abs(mdd) if mdd < 0 else np.nan,
+            "Max drawdown": mdd, "% invested": invested, "Trades": trades}
+
+
+def bench_curves(m, idx):
+    out = {}
+    for name, ser in {"Silver buy & hold": m["silver"], "Gold buy & hold": m["gold"], "S&P 500": m["spx"]}.items():
+        out[name] = ser.pct_change().shift(-1).reindex(idx).dropna()
+    out["Cash (T-bills)"] = cash_rate(m).reindex(idx)
+    return out
+
+
+def perf_table(rows):
+    return pd.DataFrame([{"Strategy": n, "CAGR": pc(p["CAGR"]), "Volatility": pc(p["Volatility"], False),
+                          "Sharpe": fm("Sharpe", p["Sharpe"]), "Sortino": fm("Sortino", p["Sortino"]),
+                          "Calmar": fm("Calmar", p["Calmar"]), "Max drawdown": pc(p["Max drawdown"]),
+                          "% invested": pc(p["% invested"], False), "Trades": p["Trades"]} for n, p in rows])
+
+
+def growth_chart(curves, common, title):
+    f = go.Figure()
+    for name, r in curves.items():
+        r = r.reindex(common).dropna()
+        f.add_scatter(x=r.index, y=(1 + r).cumprod(), name=name)
+    f.update_layout(title=title, height=400)
+    return f
 
 
 # ================================================================== UI
@@ -578,11 +793,14 @@ with st.sidebar:
     margin = st.slider("Confidence margin (points vs normal odds)", 0.02, 0.20, 0.05, 0.01, disabled=not run_ml)
     step = st.select_slider("Retrain every (months)", options=[3, 6, 12], value=6, disabled=not run_ml)
     st.subheader("Backtest")
-    mode = st.selectbox("Strategy", ["Scaled: 100% / 50% / 0%", "Only when Favorable", "Hold unless Unfavorable"])
+    mode = st.selectbox("Strategy", STRATEGIES)
     bps = st.slider("Trading cost (basis points per 100% traded)", 0, 100, 15, 5)
+    find_best = st.checkbox("🏁 Find the best strategy", False,
+                            help="Tests every strategy on every signal over the unseen test period and ranks them.")
+    rank_by = st.selectbox("Rank strategies by", RANK_METRICS, disabled=not find_best)
 
 st.title("🥈 Silver Macro Environment Analyzer")
-st.caption("Historically favorable or unfavorable macro environments for silver. Not a buy/sell signal, not financial advice.")
+st.caption("Historically favorable or unfavorable macro environments for silver and gold. Not a buy/sell signal, not financial advice.")
 bar = st.progress(0.0, text="Starting...")
 
 
@@ -664,12 +882,13 @@ tgt_txt = {"ret": "silver is higher", "gold": "silver beats gold", "cash": "silv
 st.info(f"Predicting: **{target_name}** over **{h} months**" + (" (auto-selected on the learning period only, then locked)" if auto_h else "")
         + f"  |  Indicators: **{len(META)}**")
 
-tabs_def = [("dash", "📊 Dashboard"), ("guide", "📖 Guide"), ("env", "🗺 Environments"), ("test", "🧪 Out-of-sample"),
-            ("reg", "🧭 Regimes & analogues"), ("bt", "💰 Backtest")]
+tabs_def = [("dash", "📊 Dashboard"), ("guide", "📖 Guide"), ("env", "🗺 Environments"), ("rank", "🏆 Indicator ranking"),
+            ("test", "🧪 Out-of-sample"), ("reg", "🧭 Regimes & analogues"), ("bt", "💰 Backtest")]
 if run_ml:
     tabs_def.append(("ml", "🤖 Machine learning"))
 if auto_h:
     tabs_def.append(("scan", "🔍 Look-ahead scan"))
+tabs_def.append(("now", "✅ Silver & gold now"))
 T = dict(zip([k for k, _ in tabs_def], st.tabs([n for _, n in tabs_def])))
 
 # ------------------------------------------------------------------ dashboard
@@ -682,7 +901,8 @@ with T["dash"]:
     c3.metric("Suggested exposure", f"{expo_now:.0%}", help="Share of your INTENDED silver allocation, not of your portfolio.")
     if "val_real" in F_all and pd.notna(F_all["val_real"].get(now, np.nan)):
         c4.metric("Silver price vs own history (real)", f"{F_all['val_real'][now]:.0%} percentile")
-    st.caption("Exposure = average of the rules and ML views (Favorable 100%, Neutral 50%, Unfavorable 0%) as a share of the silver allocation you already intended.")
+    st.caption("Exposure = average of the rules and ML views (Favorable 100%, Neutral 50%, Unfavorable 0%) as a share of the silver allocation you already intended. "
+               "See the last tab for a silver and gold read side by side.")
 
     cl, cr = st.columns(2)
     with cl:
@@ -718,9 +938,12 @@ with T["guide"]:
 - **Environments (rules):** each month is described by {len(META)} macro indicators, each split into Low/Neutral/High using the learning period.
   We measure silver's {h}-month outcome in each bucket and keep only environments that are statistically clear (HAC t-stat, valid for overlapping windows) and hold in both halves of history.
 - **Macro score / pillars:** favorable minus unfavorable environments, overall and per theme (monetary, dollar, industrial, liquidity & risk, gold & valuation).
+- **Indicator ranking:** how strongly each single indicator relates to the future outcome, in %, on the learning period AND on unseen data, plus by look-ahead.
 - **Machine learning:** three models estimate the chance that *{tgt_txt}*, retrained walk-forward on past data only. Judged by AUC, Brier skill, log loss and calibration.
 - **Regimes & analogues:** a growth × inflation regime, plus the 10 most similar historical months and what silver did next.
-- **Backtest:** follow the signals on the unseen test period with trading costs, versus silver, gold, stocks and cash.
+- **Backtest:** nine strategies (scaled, defensive, aggressive, silver-only-when-favorable, gold rotation, trend filters) on the unseen test period with trading costs.
+  Tick *Find the best strategy* in the sidebar to rank them all, with a first-half / second-half check on whether the winner was luck.
+- **Silver & gold now:** a separate read for silver, gold and silver-versus-gold in today's environment, with how well the rules worked on unseen data.
 - **Honesty built in:** everything is learned on the first {learn_frac:.0%} of history and judged on later months. The look-ahead is selected on the learning period and then locked.
 - **What to predict:** relative targets ask whether silver *beats* gold or cash, which is a different question from "does silver go up".
 
@@ -765,6 +988,66 @@ with T["env"]:
         c1, c2 = st.columns(2)
         c1.markdown("**Favorable:**\n" + "\n".join(f"- {state_label(c, s_)}" for c, s_ in sorted(good)) if good else "None")
         c2.markdown("**Unfavorable:**\n" + "\n".join(f"- {state_label(c, s_)}" for c, s_ in sorted(bad)) if bad else "None")
+
+# ------------------------------------------------------------------ indicator ranking
+with T["rank"]:
+    st.subheader("Which indicators predict best?")
+    st.caption(f"Target: **{target_name}** over **{h} months**. Each indicator is compared with the outcome that followed, "
+               f"first on the learning period ({learn_idx[0]:%b %Y} to {learn_idx[-1]:%b %Y}), then on data it has never seen "
+               f"({test_idx[0]:%b %Y} to {test_idx[-1]:%b %Y}). An indicator only ranks high if it works in BOTH.")
+    rk = indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h)
+    top = rk[rk["reliab"] > 0].head(3)
+    if len(top):
+        st.success("Most reliable so far: " + ", ".join(f"**{META[r.col][0]}** ({r.reliab:.0f}%)" for r in top.itertuples()))
+    else:
+        st.warning("No indicator kept the same direction on unseen data. Treat every single indicator here as unreliable for this target and look-ahead.")
+
+    st.markdown("**Ranking** (sorted by reliable strength)")
+    show_df(st, pd.DataFrame({
+        "#": range(1, len(rk) + 1),
+        "Indicator": [META[c][0] for c in rk["col"]],
+        "Pillar": [META[c][4] for c in rk["col"]],
+        "Direction": ["-" if pd.isna(v) else ("Higher → better outcome" if v > 0 else "Higher → worse outcome") for v in rk["ic_l"]],
+        "Learn correlation": [pc(v) for v in rk["ic_l"]],
+        "Unseen correlation": [pc(v) for v in rk["ic_t"]],
+        "Reliable strength": [f"{v:.0f}%" for v in rk["reliab"]],
+        "HAC t (learn)": ["-" if pd.isna(v) else f"{v:+.1f}" for v in rk["t_l"]],
+        "Hit rate (unseen)": [pc(v, False) for v in rk["hit"]],
+        "High minus Low (learn)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_l"]],
+        "High minus Low (unseen)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_t"]],
+        "Verdict": rk["status"]}))
+    st.caption("**Correlation** = rank correlation between the indicator and the outcome (±10% is already useful for macro data, below ±5% is hard to tell from noise). "
+               "**Reliable strength** = the smaller of the learn and unseen correlations, and 0% if the direction flips. "
+               "**Hit rate** = how often the learn-period direction called the above/below-median outcome on unseen data (50% = coin flip). "
+               "**High minus Low** = average outcome when the indicator was in its top third minus its bottom third. "
+               "With this many indicators tested, a few look good by luck, which is why the unseen column matters.")
+
+    d_ = rk.dropna(subset=["ic_l"])
+    if len(d_):
+        nm = [META[c][0] for c in d_["col"]]
+        bf_ = go.Figure()
+        bf_.add_bar(y=nm, x=d_["ic_l"] * 100, name="Learn period", orientation="h")
+        bf_.add_bar(y=nm, x=d_["ic_t"] * 100, name="Unseen (test) period", orientation="h")
+        bf_.update_layout(barmode="group", yaxis=dict(autorange="reversed"), height=max(420, 44 * len(d_)),
+                          xaxis_title="Correlation with the outcome (%)", title="Learn vs unseen correlation")
+        show_plot(st, bf_)
+
+    pill = rk.assign(Pillar=[META[c][4] for c in rk["col"]]).groupby("Pillar")["reliab"].agg(["mean", "max", "count"]).sort_values("mean", ascending=False)
+    st.markdown("**Which themes carry the most reliable signal**")
+    show_df(st, pd.DataFrame({"Pillar": pill.index, "Average reliable strength": [f"{v:.1f}%" for v in pill["mean"]],
+                              "Best indicator in pillar": [f"{v:.1f}%" for v in pill["max"]], "Indicators": pill["count"].values}))
+
+    st.markdown("**Which look-ahead works best for each indicator** (learn period only)")
+    ich = ic_by_horizon(m, F_ok, target, learn_frac).reindex(rk["col"])
+    zz = ich.values * 100
+    hm = go.Figure(go.Heatmap(z=zz, x=[f"{x}m" for x in ich.columns], y=[META[c][0] for c in ich.index],
+                              text=[[("" if np.isnan(v) else f"{v:+.0f}%") for v in row] for row in zz], texttemplate="%{text}",
+                              colorscale="RdYlGn", zmid=0, zmin=-max(10, np.nanmax(np.abs(zz))) if np.isfinite(zz).any() else -10,
+                              zmax=max(10, np.nanmax(np.abs(zz))) if np.isfinite(zz).any() else 10, showscale=False, xgap=3, ygap=3))
+    hm.update_layout(height=max(420, 36 * len(ich)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
+    show_plot(st, hm)
+    st.caption("Green = higher indicator values were followed by better outcomes, red = worse. Longer look-aheads have far fewer independent observations, "
+               "so strong-looking numbers on the right are less trustworthy. This grid uses the learn period only.")
 
 # ------------------------------------------------------------------ out of sample
 with T["test"]:
@@ -820,37 +1103,109 @@ with T["reg"]:
 # ------------------------------------------------------------------ backtest
 with T["bt"]:
     st.subheader("What if you had followed the signals? (test period only)")
-    st.caption(f"Strategy: {mode}. Signal at each month-end sets the position for the next month. Idle money earns the T-bill rate. Cost: {bps} bps per 100% traded.")
-    curves, rows = {}, []
     rf_all = cash_rate(m)
-    sig = {"Rules strategy": verdict.loc[test_idx]}
+
+    # signal sources, all restricted to the same months so everything is comparable
+    src = {"Rules": verdict.loc[test_idx]}
     if run_ml and not ml[ml_choice].empty:
-        sig[f"ML strategy ({ml_choice})"] = ml_verdict(ml[ml_choice], margin)
-    common = None
-    for name, v in sig.items():
-        ex = exposure_from(v, mode)
-        ret, turn = run_backtest(m, ex, bps)
-        curves[name] = ret
-        rows.append((name, perf(ret, rf_all, ex.reindex(ret.index).mean(), int((turn > 0).sum()))))
-        common = ret.index if common is None else common.intersection(ret.index)
-    for name, ser in {"Silver buy & hold": m["silver"], "Gold buy & hold": m["gold"], "S&P 500": m["spx"]}.items():
-        ret = ser.pct_change().shift(-1).reindex(common).dropna()
-        curves[name] = ret
-        rows.append((name, perf(ret, rf_all, 1.0, 1)))
-    curves["Cash (T-bills)"] = rf_all.reindex(common)
-    rows.append(("Cash (T-bills)", perf(curves["Cash (T-bills)"], rf_all, 0.0, 0)))
-    ef = go.Figure()
-    for name, r in curves.items():
-        r = r.reindex(common).dropna()
-        ef.add_scatter(x=r.index, y=(1 + r).cumprod(), name=name)
-    ef.update_layout(title="Growth of 1 unit", height=400)
-    show_plot(st, ef)
-    tbl = pd.DataFrame([{"Strategy": n, "CAGR": pc(p["CAGR"]), "Volatility": pc(p["Volatility"], False),
-                         "Sharpe": f"{p['Sharpe']:.2f}", "Sortino": f"{p['Sortino']:.2f}" if pd.notna(p["Sortino"]) else "-",
-                         "Max drawdown": pc(p["Max drawdown"]), "% invested": pc(p["% invested"], False),
-                         "Trades": p["Trades"]} for n, p in rows])
-    show_df(st, tbl)
-    st.caption("A short test period and a handful of trades make these numbers noisy. If the strategy only wins by sitting in cash during drawdowns, check max drawdown and Sharpe, not just CAGR.")
+        mv = ml_verdict(ml[ml_choice], margin)
+        src[f"ML ({ml_choice})"] = mv
+        both = src["Rules"].index.intersection(mv.index)
+        e_ = (src["Rules"].loc[both].map(EXPO) + mv.loc[both].map(EXPO)) / 2
+        comb = pd.Series(NEU, index=both)
+        comb[e_ >= 0.75] = FAV
+        comb[e_ <= 0.25] = UNF
+        src["Rules + ML combined"] = comb
+    bt_idx = None
+    for v_ in src.values():
+        bt_idx = v_.index if bt_idx is None else bt_idx.intersection(v_.index)
+    nxt = m["silver"].pct_change().shift(-1).notna() & m["gold"].pct_change().shift(-1).notna()
+    bt_idx = bt_idx[nxt.reindex(bt_idx).fillna(False).values.astype(bool)]
+    src = {k: v_.loc[bt_idx] for k, v_ in src.items()}
+    trend = (m["silver"] > m["silver"].rolling(10).mean()).reindex(bt_idx).fillna(False).astype(bool)
+
+    if len(bt_idx) < 12:
+        st.warning("The test period is too short for a backtest. Move the start date earlier or lower the learn share.")
+    else:
+        st.caption(f"Strategy shown: **{mode}**. Signal at each month-end sets the position for the next month. Idle money earns the T-bill rate. "
+                   f"Cost: {bps} bps per 100% traded (switching silver to gold trades both). {len(bt_idx)} months, {bt_idx[0]:%b %Y} to {bt_idx[-1]:%b %Y}.")
+        curves, rows = {}, []
+        pairs = [("Trend only (no macro signal)", next(iter(src.values())))] if mode in NO_SIGNAL else list(src.items())
+        for sname, v_ in pairs:
+            W = strategy_weights(mode, v_, trend)
+            ret, turn = run_backtest_w(m, W, bps)
+            curves[sname] = ret
+            rows.append((sname, perf(ret, rf_all, (W["silver"] + W["gold"]).reindex(ret.index).mean(), int((turn > 0).sum()))))
+        for bname, bret in bench_curves(m, bt_idx).items():
+            curves[bname] = bret
+            is_cash = bname.startswith("Cash")
+            rows.append((bname, perf(bret, rf_all, 0.0 if is_cash else 1.0, 0 if is_cash else 1)))
+        show_plot(st, growth_chart(curves, bt_idx, "Growth of 1 unit"))
+        show_df(st, perf_table(rows))
+        st.caption("A short test period and a handful of trades make these numbers noisy. If the strategy only wins by sitting in cash during drawdowns, check max drawdown and Sharpe, not just CAGR.")
+
+        if find_best:
+            st.markdown("---")
+            st.subheader(f"🏁 Strategy leaderboard (ranked by {rank_by})")
+            res, rets = [], {}
+            first_src = next(iter(src))
+            for sname, v_ in src.items():
+                for strat in STRATEGIES:
+                    if strat in NO_SIGNAL and sname != first_src:
+                        continue
+                    W = strategy_weights(strat, v_, trend)
+                    ret, turn = run_backtest_w(m, W, bps)
+                    if len(ret) < 12:
+                        continue
+                    half = len(ret) // 2
+                    inv = (W["silver"] + W["gold"]).reindex(ret.index).mean()
+                    p_all = perf(ret, rf_all, inv, int((turn > 0).sum()))
+                    p1, p2 = perf(ret.iloc[:half], rf_all), perf(ret.iloc[half:], rf_all)
+                    lab = "No macro signal" if strat in NO_SIGNAL else sname
+                    key_ = f"{lab} · {strat}"
+                    rets[key_] = ret
+                    res.append(dict(key=key_, signal=lab, strat=strat, p=p_all,
+                                    val=p_all[rank_by], v1=p1[rank_by], v2=p2[rank_by]))
+            bs = bench_curves(m, bt_idx)["Silver buy & hold"]
+            hb = len(bs) // 2
+            b1, b2 = perf(bs.iloc[:hb], rf_all)[rank_by], perf(bs.iloc[hb:], rf_all)[rank_by]
+            if not res:
+                st.info("No strategy had enough months to rank.")
+            else:
+                res.sort(key=lambda r_: -np.inf if pd.isna(r_["val"]) else r_["val"], reverse=True)
+                medals = ["🥇", "🥈", "🥉"]
+                lb = pd.DataFrame([{
+                    "#": medals[i] if i < 3 else str(i + 1), "Signal": r_["signal"], "Strategy": r_["strat"],
+                    "CAGR": pc(r_["p"]["CAGR"]), "Volatility": pc(r_["p"]["Volatility"], False),
+                    "Sharpe": fm("Sharpe", r_["p"]["Sharpe"]), "Sortino": fm("Sortino", r_["p"]["Sortino"]),
+                    "Calmar": fm("Calmar", r_["p"]["Calmar"]), "Max drawdown": pc(r_["p"]["Max drawdown"]),
+                    "% invested": pc(r_["p"]["% invested"], False), "Trades": r_["p"]["Trades"],
+                    f"{rank_by}, 1st half": fm(rank_by, r_["v1"]), f"{rank_by}, 2nd half": fm(rank_by, r_["v2"]),
+                    "Beats silver in both halves?": "✅" if (pd.notna(r_["v1"]) and pd.notna(r_["v2"]) and r_["v1"] > b1 and r_["v2"] > b2) else "❌"}
+                    for i, r_ in enumerate(res)])
+                show_df(st, lb)
+                st.caption(f"Silver buy & hold for reference: {rank_by} {fm(rank_by, perf(bs, rf_all)[rank_by])} overall "
+                           f"({fm(rank_by, b1)} first half, {fm(rank_by, b2)} second half). "
+                           "'Beats silver in both halves' means the strategy had a better ranking metric than silver buy & hold in each half of the test period.")
+                best = res[0]
+                st.success(f"Best on {rank_by} over the whole test period: **{best['strat']}** with **{best['signal']}** "
+                           f"({rank_by} {fm(rank_by, best['val'])}, CAGR {pc(best['p']['CAGR'])}, max drawdown {pc(best['p']['Max drawdown'])}).")
+
+                top_curves = {r_["key"]: rets[r_["key"]] for r_ in res[:3]}
+                top_curves.update({k_: v_ for k_, v_ in bench_curves(m, bt_idx).items() if k_ in ("Silver buy & hold", "Gold buy & hold")})
+                show_plot(st, growth_chart(top_curves, bt_idx, "Top 3 strategies vs buy & hold"))
+
+                valid = [r_ for r_ in res if pd.notna(r_["v1"]) and pd.notna(r_["v2"])]
+                if len(valid) >= 3:
+                    pick = max(valid, key=lambda r_: r_["v1"])
+                    v2s = sorted([r_["v2"] for r_ in valid], reverse=True)
+                    rank2 = v2s.index(pick["v2"]) + 1
+                    msg = (f"**Honesty check.** Picking the best strategy using only the FIRST half of the test period gives "
+                           f"**{pick['strat']}** with **{pick['signal']}**. In the SECOND half it scored {rank_by} {fm(rank_by, pick['v2'])}, "
+                           f"ranking **{rank2} of {len(valid)}** (median strategy {fm(rank_by, float(np.median(v2s)))}, silver buy & hold {fm(rank_by, b2)}).")
+                    (st.success if rank2 <= max(1, len(valid) // 3) and pick["v2"] > b2 else st.warning)(msg)
+                st.warning(f"Choosing the best of {len(res)} strategies on the same data used to rank them flatters the winner. "
+                           "Trust a strategy more when it ranks well in both halves, beats silver buy & hold in both halves, and the honesty check above holds up.")
 
 # ------------------------------------------------------------------ machine learning
 if run_ml:
@@ -926,3 +1281,68 @@ Each look-ahead is fitted on the **first 70% of the learning period** and scored
         show_df(st, d[["Look-ahead", "rules_ic", "ml_ic", "combined", "stable", "Independent obs."]].rename(
             columns={"rules_ic": "Rules IC", "ml_ic": "ML IC", "combined": "Average IC", "stable": "Stable IC"}))
         st.caption("Longer look-aheads have far fewer independent observations. If every IC is near zero, there is no reliable horizon, and that is a valid answer.")
+
+# ------------------------------------------------------------------ silver & gold now
+with T["now"]:
+    st.subheader(f"✅ Silver & gold: where the environment stands now ({now:%b %Y})")
+    st.caption(f"Each market gets its own rules and ML read for the next {h} months, using the same indicators and settings. "
+               "Favorable / Unfavorable describes how similar environments played out historically. It is not a buy or sell instruction.")
+    with st.spinner("Analysing silver, gold and silver vs gold..."):
+        NOW = {k: analyse_target(k, m, F_ok, h, learn_frac, t_thr, need_consistent, run_ml, ml_choice, step, margin) for k in NOW_KINDS}
+
+    for col, k in zip(st.columns(3), NOW_KINDS):
+        r = NOW[k]
+        box = card(col)
+        box.markdown(f"### {r['icon']} {NOW_NAMES[k]}")
+        box.markdown(f"**{REL_TXT[r['label']] if k == 'gold' else r['label']}**")
+        box.markdown(f"Rules: {ICON[r['rules']]} {r['rules']} (score {r['score']:+d})")
+        if r["ml"]:
+            box.markdown(f"ML: {r['ml']['p']:.0%} chance {NOW_PHRASE[k]} in {h}m (normal {r['ml']['base']:.0%}) → {ICON[r['ml']['verdict']]} {r['ml']['verdict']}")
+        box.markdown(f"Similar past periods: median {pc(r['ana_med'])}, {r['ana_pos']:.0%} positive")
+        box.markdown(f"Evidence on unseen data: **{r['ev_level']}**")
+        box.caption(r["ev_text"])
+        if r["ml"] and pd.notna(r["ml"]["auc"]):
+            box.caption(f"ML on unseen data: AUC {r['ml']['auc']:.2f}, Brier skill {r['ml']['bss']:+.3f}.")
+        if r["why_good"]:
+            box.markdown("**Helping now:** " + "; ".join(r["why_good"][:4]))
+        if r["why_bad"]:
+            box.markdown("**Hurting now:** " + "; ".join(r["why_bad"][:4]))
+
+    es, eg, er = NOW["ret"]["e"], NOW["goldabs"]["e"], NOW["gold"]["e"]
+    sl, gl = NOW["ret"]["label"].lower(), NOW["goldabs"]["label"].lower()
+    if es >= 0.7 and eg >= 0.7:
+        msg = "Both silver and gold sit in historically favorable environments."
+    elif es <= 0.3 and eg <= 0.3:
+        msg = "Both silver and gold sit in historically unfavorable environments."
+    elif es >= 0.7:
+        msg = f"Silver's environment is historically favorable ({sl}), while gold's is {gl}."
+    elif eg >= 0.7:
+        msg = f"Gold's environment is historically favorable ({gl}), while silver's is {sl}."
+    elif es <= 0.3:
+        msg = f"Silver's environment is historically unfavorable ({sl}), while gold's is {gl}."
+    elif eg <= 0.3:
+        msg = f"Gold's environment is historically unfavorable ({gl}), while silver's is {sl}."
+    else:
+        msg = "Neither metal is in a clearly favorable or unfavorable environment: mostly neutral."
+    if er >= 0.7:
+        msg += " Similar conditions have historically favored silver over gold."
+    elif er <= 0.3:
+        msg += " Similar conditions have historically favored gold over silver."
+    else:
+        msg += " There is no clear silver-versus-gold preference."
+    (st.success if max(es, eg) >= 0.7 else (st.warning if min(es, eg) <= 0.3 else st.info))(msg)
+
+    weak = [NOW_NAMES[k] for k in NOW_KINDS if NOW[k]["ev_level"] != "Strong"]
+    if weak:
+        st.caption("Evidence is Weak, None or Unknown for: " + ", ".join(weak) + ". For those, the label describes today's conditions "
+                   "but the rules did not reliably predict outcomes on data they had never seen, so treat it as context, not a signal.")
+
+    show_df(st, pd.DataFrame([{
+        "Market": NOW_NAMES[k],
+        "Overall": f"{NOW[k]['icon']} {REL_TXT[NOW[k]['label']] if k == 'gold' else NOW[k]['label']}",
+        "Rules": f"{ICON[NOW[k]['rules']]} {NOW[k]['rules']}",
+        "ML chance": "-" if not NOW[k]["ml"] else f"{NOW[k]['ml']['p']:.0%} (normal {NOW[k]['ml']['base']:.0%})",
+        "Similar periods, median": pc(NOW[k]["ana_med"]),
+        "Evidence": NOW[k]["ev_level"]} for k in NOW_KINDS]))
+    st.warning("**Educational only, not financial advice.** This reads macro conditions only. It does not know about valuation, news, taxes, "
+               "your goals or your time horizon, and relationships that held in the past can stop working.")
