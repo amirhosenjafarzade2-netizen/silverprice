@@ -8,6 +8,7 @@ Run locally:  streamlit run app.py
 requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests
 """
 import io
+import os
 
 import numpy as np
 import pandas as pd
@@ -20,10 +21,11 @@ st.set_page_config(page_title="Silver Macro Environment Analyzer", page_icon="�
 
 FRED = {"real_yield": "DFII10", "breakeven": "T10YIE", "fed_funds": "DFF", "curve": "T10Y2Y"}
 YF = {"silver": "SI=F", "gold": "GC=F", "dollar": "DX-Y.NYB", "oil": "CL=F",
-      "copper": "HG=F", "vix": "^VIX", "spx": "^GSPC"}
+      "copper": "HG=F", "vix": "^VIX", "spx": "^GSPC",
+      "tnx": "^TNX", "irx": "^IRX"}  # tnx/irx = Yahoo rate proxies, used if FRED is unreachable
 
 # indicator -> (plain title, label when LOW, label when HIGH, is it a % change?)
-META = {
+META_ALL = {
     "real_yield":     ("Real 10y interest rate (level)", "Low / negative real rates", "High real rates", False),
     "real_yield_chg": ("Real rate, 3-month change", "Real rates falling", "Real rates rising", False),
     "breakeven":      ("Inflation expectations (10y)", "Low inflation expectations", "High inflation expectations", False),
@@ -35,7 +37,11 @@ META = {
     "vix":            ("Market fear (VIX)", "Calm markets", "Fearful markets", False),
     "spx_mom":        ("Stocks (S&P 500), 3-month trend", "Stocks falling", "Stocks rising", True),
     "gs_ratio":       ("Gold/silver ratio", "Silver expensive vs gold", "Silver cheap vs gold", False),
+    # fallback-only (used when FRED real-rate data can't be downloaded)
+    "nom_yield":      ("10y Treasury yield (level)", "Low yields", "High yields", False),
+    "nom_yield_chg":  ("10y Treasury yield, 3-month change", "Yields falling", "Yields rising", False),
 }
+META = dict(META_ALL)  # narrowed to the available indicators after data loads
 STATES = ["Low", "Mid", "High"]
 
 
@@ -45,13 +51,35 @@ def state_label(col, state):
 
 # ------------------------------------------------------------------ data
 def fred_series(series_id: str, start: str) -> pd.Series:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    d = pd.read_csv(io.StringIO(r.text), na_values=[".", ""])
-    d.columns = ["date", "value"]
-    d["date"] = pd.to_datetime(d["date"])
-    return d.set_index("date")["value"].astype(float)
+    """FRED via optional API key (st.secrets / env FRED_API_KEY), else the public CSV, with retries."""
+    key = None
+    try:
+        key = st.secrets.get("FRED_API_KEY")
+    except Exception:
+        pass
+    key = key or os.environ.get("FRED_API_KEY")
+    last = None
+    for _ in range(2):
+        try:
+            if key:
+                r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                                 params=dict(series_id=series_id, api_key=key, file_type="json",
+                                             observation_start=start), timeout=(10, 30))
+                r.raise_for_status()
+                obs = r.json()["observations"]
+                d = pd.DataFrame(obs)[["date", "value"]]
+                d["value"] = pd.to_numeric(d["value"], errors="coerce")
+            else:
+                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+                r = requests.get(url, timeout=(10, 30), headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                d = pd.read_csv(io.StringIO(r.text), na_values=[".", ""])
+                d.columns = ["date", "value"]
+            d["date"] = pd.to_datetime(d["date"])
+            return d.set_index("date")["value"].astype(float)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise last
 
 
 def month_end(df: pd.DataFrame) -> pd.DataFrame:
@@ -62,29 +90,58 @@ def month_end(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
-def load_monthly(start: str) -> pd.DataFrame:
+def yahoo_daily(start: str) -> pd.DataFrame:
     px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False)["Close"]
-    px = px.rename(columns={v: k for k, v in YF.items()})
-    fr = pd.concat({k: fred_series(v, start) for k, v in FRED.items()}, axis=1)
-    daily = px.join(fr, how="outer").sort_index().ffill()
-    daily = daily.dropna(subset=["silver"])
-    return month_end(daily).dropna(subset=["silver"])
+    return px.rename(columns={v: k for k, v in YF.items()})
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def fred_cached(series_id: str, start: str) -> pd.Series:
+    return fred_series(series_id, start)  # exceptions are not cached, so failures retry next run
+
+
+def load_monthly(start: str):
+    px = yahoo_daily(start)
+    fr, failed = {}, []
+    for k, v in FRED.items():
+        try:
+            fr[k] = fred_cached(v, start)
+        except Exception:  # noqa: BLE001
+            failed.append(k)
+            if len(failed) == 1 and k == "real_yield":
+                failed += [x for x in FRED if x != k]  # host is down: don't wait for the rest
+                break
+    daily = px.join(pd.concat(fr, axis=1), how="outer") if fr else px
+    daily = daily.sort_index().ffill().dropna(subset=["silver"])
+    return month_end(daily).dropna(subset=["silver"]), sorted(set(failed))
 
 
 def build_features(m: pd.DataFrame) -> pd.DataFrame:
+    def g(k):
+        return m[k] if k in m else pd.Series(np.nan, index=m.index)
+
     F = pd.DataFrame(index=m.index)
-    F["real_yield"] = m["real_yield"]
-    F["real_yield_chg"] = m["real_yield"].diff(3)
-    F["breakeven"] = m["breakeven"]
-    F["fed_chg"] = m["fed_funds"].diff(6)
-    F["curve"] = m["curve"]
-    F["dollar_mom"] = m["dollar"].pct_change(3)
-    F["oil_mom"] = m["oil"].pct_change(3).clip(-0.8, 1.5)  # 2020 negative oil price glitch
-    F["copper_mom"] = m["copper"].pct_change(3)
-    F["vix"] = m["vix"]
-    F["spx_mom"] = m["spx"].pct_change(3)
-    F["gs_ratio"] = m["gold"] / m["silver"]
-    return F[list(META)]
+    F["real_yield"] = g("real_yield")
+    F["real_yield_chg"] = g("real_yield").diff(3)
+    F["breakeven"] = g("breakeven")
+    F["fed_chg"] = g("fed_funds").diff(6)
+    F["curve"] = g("curve")
+    F["nom_yield"] = g("tnx")
+    F["nom_yield_chg"] = g("tnx").diff(3)
+    if F["fed_chg"].isna().all():            # FRED fallback: 3-month T-bill yield as the policy-rate proxy
+        F["fed_chg"] = g("irx").diff(6)
+    if F["curve"].isna().all():              # FRED fallback: 10y minus 3-month
+        F["curve"] = g("tnx") - g("irx")
+    F["dollar_mom"] = g("dollar").pct_change(3)
+    F["oil_mom"] = g("oil").pct_change(3).clip(-0.8, 1.5)  # 2020 negative oil price glitch
+    F["copper_mom"] = g("copper").pct_change(3)
+    F["vix"] = g("vix")
+    F["spx_mom"] = g("spx").pct_change(3)
+    F["gs_ratio"] = g("gold") / g("silver")
+    keep = [c for c in META_ALL if F[c].notna().any()]
+    if "real_yield" in keep:                 # real-rate data available: the Treasury-yield stand-ins aren't needed
+        keep = [c for c in keep if not c.startswith("nom_")]
+    return F[keep]
 
 
 # ------------------------------------------------------------------ analysis
@@ -189,12 +246,19 @@ st.caption("Which macro conditions have been good or bad for buying silver, and 
 
 try:
     with st.spinner("Downloading market + FRED macro data..."):
-        m = load_monthly(start)
+        m, failed = load_monthly(start)
 except Exception as e:
-    st.error(f"Could not download data: {e}")
+    st.error(f"Could not download market data: {e}")
     st.stop()
 
 F = build_features(m)
+META = {c: META_ALL[c] for c in F.columns}  # only indicators we actually have
+if failed:
+    st.warning(
+        "FRED (the source for real rates and inflation expectations) did not respond, so the app is using "
+        "Yahoo Finance stand-ins: 10y Treasury yield and the 3-month T-bill. Real rates and inflation "
+        "expectations are missing from this run. Reload later to retry, or add a free FRED API key "
+        "(see Settings > Secrets: FRED_API_KEY = \"your_key\") for reliable access.")
 F_ok = F.dropna()
 fwd = (m["silver"].shift(-h) / m["silver"] - 1).reindex(F_ok.index)
 ev = F_ok.index.intersection(fwd.dropna().index)
@@ -219,8 +283,8 @@ tab_guide, tab_map, tab_rank, tab_test, tab_now = st.tabs(
 with tab_guide:
     st.markdown(f"""
 ### How this works (plain English)
-1. Each month since {start[:4]} is described by **11 macro conditions**: interest rates, inflation expectations,
-   the Fed, the dollar, oil, copper, stocks, fear, and the gold/silver ratio.
+1. Each month since {start[:4]} is described by **{len(META)} macro conditions**: interest rates, inflation expectations,
+   the Fed, the dollar, oil, copper, stocks, fear, and the gold/silver ratio (where data is available).
 2. Every condition is split into **Low / Neutral / High** (for example "dollar weakening / flat / strengthening").
 3. For each one, we measure what silver did over the **next {h} months**.
 4. Conditions where silver did clearly better than average become **buy-friendly signals**; the clearly worse ones become **avoid signals**.
@@ -282,7 +346,7 @@ with tab_rank:
         st.dataframe(rank_table(stats.sort_values("edge").head(6)), hide_index=True, use_container_width=True)
     st.caption(f"'vs. average' = extra silver return compared with the average month ({fwd.loc[learn_idx].mean():+.1%} over {h} months). "
                "'Strength' ≈ t-statistic; above ±2 is fairly strong, and it is adjusted for overlapping periods. "
-               "With 33 environments tested, a few will look good purely by luck. That is why the next tab matters.")
+               f"With {len(stats)} environments tested, a few will look good purely by luck. That is why the next tab matters.")
     st.markdown(f"**Rules in use** (strength ≥ {t_thr}{', held in both halves' if need_consistent else ''}): "
                 f"{len(good)} buy-friendly, {len(bad)} avoid.")
     if good or bad:
