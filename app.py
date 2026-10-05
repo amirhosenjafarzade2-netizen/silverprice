@@ -1,5 +1,5 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v3
+Silver Macro Environment Analyzer (Streamlit), v3.1
 
 Which macro environments have been historically favorable / unfavorable for silver, what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
@@ -7,9 +7,14 @@ what happened in comparable periods, and would following it have worked (with co
 requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn
 Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access.
 Educational only, not financial advice.
+
+v3.1 changes:
+- All downloads (Yahoo + 8 FRED series) run in parallel in one cached function.
+- Progress callbacks removed from @st.cache_data functions (fixes CacheReplayClosureError).
 """
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -91,26 +96,30 @@ def state_label(col, state):
 
 
 # ------------------------------------------------------------------ data
-def fred_series(series_id: str, start: str) -> pd.Series:
+def get_fred_key():
     key = None
     try:
         key = st.secrets.get("FRED_API_KEY")
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
-    key = key or os.environ.get("FRED_API_KEY")
+    return key or os.environ.get("FRED_API_KEY")
+
+
+def _fred_fetch(series_id, start, key):
+    """Plain function (no Streamlit calls) so it is safe inside worker threads."""
     last = None
     for _ in range(2):
         try:
             if key:
                 r = requests.get("https://api.stlouisfed.org/fred/series/observations",
                                  params=dict(series_id=series_id, api_key=key, file_type="json",
-                                             observation_start=start), timeout=(10, 30))
+                                             observation_start=start), timeout=(5, 20))
                 r.raise_for_status()
                 d = pd.DataFrame(r.json()["observations"])[["date", "value"]]
                 d["value"] = pd.to_numeric(d["value"], errors="coerce")
             else:
                 url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-                r = requests.get(url, timeout=(10, 30), headers={"User-Agent": "Mozilla/5.0"})
+                r = requests.get(url, timeout=(5, 20), headers={"User-Agent": "Mozilla/5.0"})
                 r.raise_for_status()
                 d = pd.read_csv(io.StringIO(r.text), na_values=[".", ""])
                 d.columns = ["date", "value"]
@@ -121,6 +130,11 @@ def fred_series(series_id: str, start: str) -> pd.Series:
     raise last
 
 
+def _yahoo_fetch(start):
+    px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False, threads=True)["Close"]
+    return px.rename(columns={v: k for k, v in YF.items()})
+
+
 def month_end(df):
     try:
         return df.resample("ME").last()
@@ -129,33 +143,30 @@ def month_end(df):
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
-def yahoo_daily(start):
-    px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False)["Close"]
-    return px.rename(columns={v: k for k, v in YF.items()})
-
-
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def fred_cached(series_id, start):
-    return fred_series(series_id, start)  # failures are not cached
+def load_raw(pre, key):
+    """Yahoo + all FRED series downloaded in parallel. Exceptions from Yahoo are not cached."""
+    with ThreadPoolExecutor(max_workers=len(FRED) + 1) as ex:
+        fy = ex.submit(_yahoo_fetch, pre)
+        ff = {k: ex.submit(_fred_fetch, v, pre, key) for k, v in FRED.items()}
+        px = fy.result()
+        fr, failed = {}, []
+        for k, f in ff.items():
+            try:
+                fr[k] = f.result()
+            except Exception:  # noqa: BLE001
+                failed.append(k)
+    return px, fr, failed
 
 
 def load_monthly(start, cb=None):
     cb = cb or (lambda f, t: None)
     pre = (pd.Timestamp(start) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")  # warm-up history for rolling stats
-    cb(0.02, "Downloading market data (Yahoo Finance)...")
-    px = yahoo_daily(pre)
-    cb(0.15, "Market data ready. Downloading macro data (FRED)...")
-    fr, failed = {}, []
-    items = list(FRED.items())
-    for i, (k, v) in enumerate(items):
-        cb(0.15 + 0.2 * i / len(items), f"Downloading macro data: {v}...")
-        try:
-            fr[k] = fred_cached(v, pre)
-        except Exception:  # noqa: BLE001
-            failed.append(k)
-            if k == "real_yield":  # host is down: skip the rest
-                failed += [x for x in FRED if x != k]
-                break
+    cb(0.05, "Downloading market + macro data in parallel (first run only, then cached)...")
+    px, fr, failed = load_raw(pre, get_fred_key())
+    if failed or px.empty:
+        load_raw.clear()  # don't keep a partial result for 6 hours; retry next run
+    if "real_yield" in failed:  # FRED host is down: fall back to Yahoo stand-ins
+        fr, failed = {}, list(FRED)
 
     def lag(s, days):
         return s.set_axis(s.index + pd.DateOffset(months=1) + pd.Timedelta(days=days))
@@ -397,11 +408,12 @@ def make_model(name):
 
 
 @st.cache_data(show_spinner=False)
-def walk_forward(Fev, fwdev, h, cut, step, model_name, _cb=None):
+def walk_forward(Fev, fwdev, h, cut, step, model_name):
+    """No Streamlit calls in here (progress is reported by the caller)."""
     y, X = (fwdev > 0).astype(int).values, Fev.values
     starts = list(range(cut, len(Fev), step))
     out = []
-    for i, s0 in enumerate(starts):
+    for s0 in starts:
         tr_end, te = s0 - h, slice(s0, min(s0 + step, len(Fev)))
         if tr_end < 36:
             continue
@@ -411,8 +423,6 @@ def walk_forward(Fev, fwdev, h, cut, step, model_name, _cb=None):
         else:
             p = make_model(model_name).fit(X[:tr_end], ytr).predict_proba(X[te])[:, 1]
         out.append(pd.DataFrame({"p": p, "base": ytr.mean()}, index=Fev.index[te]))
-        if _cb:
-            _cb((i + 1) / len(starts), model_name)
     return pd.concat(out) if out else pd.DataFrame(columns=["p", "base"])
 
 
@@ -447,15 +457,16 @@ def prob_metrics(wf, y):
 
 
 @st.cache_data(show_spinner=False)
-def scan_horizons(m, F_ok, target, model_name, learn_frac, t_thr, need_consistent, horizons, _cb=None):
-    """Choose the look-ahead using ONLY the learn period (fit on first 70%, score last 30%)."""
+def scan_horizons(m, F_ok, target, model_name, learn_frac, t_thr, need_consistent, horizons):
+    """Choose the look-ahead using ONLY the learn period (fit on first 70%, score last 30%).
+    No Streamlit calls in here (progress is reported by the caller)."""
     def ics(pred, ret, V):
         half = len(V) // 2
         full, a, b = rank_ic(pred.loc[V], ret.loc[V]), rank_ic(pred.loc[V[:half]], ret.loc[V[:half]]), rank_ic(pred.loc[V[half:]], ret.loc[V[half:]])
         return full, (min(a, b) if not (np.isnan(a) or np.isnan(b)) else np.nan)
 
     rows = []
-    for i, h_ in enumerate(horizons):
+    for h_ in horizons:
         fwd_ = target_returns(m, F_ok.index, h_, target)
         _, _, learn_, _ = split_idx(F_ok, fwd_, h_, learn_frac)
         k = int(len(learn_) * 0.7)
@@ -471,8 +482,6 @@ def scan_horizons(m, F_ok, target, model_name, learn_frac, t_thr, need_consisten
                 p = pd.Series(mdl.predict_proba(F_ok.loc[V].values)[:, 1], index=V)
                 row["ml_ic"], row["ml_stab"] = ics(p, fwd_, V)
         rows.append(row)
-        if _cb:
-            _cb((i + 1) / len(horizons), f"Testing the {h_}-month look-ahead...")
     d = pd.DataFrame(rows)
     d["combined"] = d[["rules_ic", "ml_ic"]].mean(axis=1, skipna=True)
     d["stable"] = d[["rules_stab", "ml_stab"]].mean(axis=1, skipna=True)
@@ -610,8 +619,8 @@ elif failed:
 
 scan = None
 if auto_h:
-    scan = scan_horizons(m, F_ok, target, ml_choice if run_ml else None, learn_frac, t_thr, need_consistent, HORIZONS,
-                         lambda f, t: cb(0.35 + 0.15 * f, t))
+    cb(0.35, "Scanning look-ahead periods (cached after the first run)...")
+    scan = scan_horizons(m, F_ok, target, ml_choice if run_ml else None, learn_frac, t_thr, need_consistent, HORIZONS)
     key = "stable" if scan["stable"].notna().any() else "combined"
     h = int(scan.loc[scan[key].idxmax(), "h"]) if scan[key].notna().any() else 6
 else:
@@ -632,8 +641,8 @@ ml = {}
 if run_ml:
     Fev, fev = F_ok.loc[ev], fwd.loc[ev]
     for i, name in enumerate(ML_MODELS):
-        ml[name] = walk_forward(Fev, fev, h, cut, step, name,
-                                lambda f, t, i=i: cb(0.55 + 0.45 * (i + f) / len(ML_MODELS), f"Training {t} ({h}-month look-ahead)..."))
+        cb(0.55 + 0.45 * i / len(ML_MODELS), f"Training {name} ({h}-month look-ahead)...")
+        ml[name] = walk_forward(Fev, fev, h, cut, step, name)
     ml_p, ml_base, ml_imp, ml_contrib = fit_today(Fev, fev, F_ok.iloc[-1], ml_choice)
 cb(1.0, "Done")
 bar.empty()
