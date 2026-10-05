@@ -1,264 +1,353 @@
 """
-Silver Price Direction Predictor (Streamlit)
+Silver Macro Environment Analyzer (Streamlit)
 
-Run:
-    pip install streamlit yfinance pandas numpy scikit-learn plotly
-    # optional, for the deep learning model:
-    pip install tensorflow
-    streamlit run silver_app.py
+Question answered: under which macro conditions has silver historically done well
+(good time to buy) and badly (avoid)? And what is the environment today?
+
+Run locally:  streamlit run app.py
+requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests
 """
+import io
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import accuracy_score
 
-st.set_page_config(page_title="Silver Direction Predictor", page_icon="🥈", layout="wide")
+st.set_page_config(page_title="Silver Macro Environment Analyzer", page_icon="🥈", layout="wide")
 
-# Assets the documents say move together with silver
-TICKERS = {
-    "Silver": "SI=F",
-    "Gold": "GC=F",
-    "Platinum": "PL=F",
-    "Copper": "HG=F",
-    "Oil": "CL=F",
-    "Dollar": "DX-Y.NYB",
-    "SP500": "^GSPC",
+FRED = {"real_yield": "DFII10", "breakeven": "T10YIE", "fed_funds": "DFF", "curve": "T10Y2Y"}
+YF = {"silver": "SI=F", "gold": "GC=F", "dollar": "DX-Y.NYB", "oil": "CL=F",
+      "copper": "HG=F", "vix": "^VIX", "spx": "^GSPC"}
+
+# indicator -> (plain title, label when LOW, label when HIGH, is it a % change?)
+META = {
+    "real_yield":     ("Real 10y interest rate (level)", "Low / negative real rates", "High real rates", False),
+    "real_yield_chg": ("Real rate, 3-month change", "Real rates falling", "Real rates rising", False),
+    "breakeven":      ("Inflation expectations (10y)", "Low inflation expectations", "High inflation expectations", False),
+    "fed_chg":        ("Fed funds rate, 6-month change", "Fed cutting", "Fed hiking", False),
+    "curve":          ("Yield curve (10y minus 2y)", "Flat / inverted curve", "Steep curve", False),
+    "dollar_mom":     ("US Dollar, 3-month trend", "Dollar weakening", "Dollar strengthening", True),
+    "oil_mom":        ("Oil, 3-month trend", "Oil falling", "Oil rising", True),
+    "copper_mom":     ("Copper, 3-month trend (growth proxy)", "Copper falling", "Copper rising", True),
+    "vix":            ("Market fear (VIX)", "Calm markets", "Fearful markets", False),
+    "spx_mom":        ("Stocks (S&P 500), 3-month trend", "Stocks falling", "Stocks rising", True),
+    "gs_ratio":       ("Gold/silver ratio", "Silver expensive vs gold", "Silver cheap vs gold", False),
 }
+STATES = ["Low", "Mid", "High"]
 
 
-# ---------------------------------------------------------------- data
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_data(start: str) -> pd.DataFrame:
-    raw = yf.download(list(TICKERS.values()), start=start, auto_adjust=True, progress=False)["Close"]
-    raw = raw.rename(columns={v: k for k, v in TICKERS.items()})
-    raw = raw[[c for c in TICKERS if c in raw.columns]]
-    return raw.ffill().dropna()
+def state_label(col, state):
+    return {"Low": META[col][1], "Mid": "Neutral", "High": META[col][2]}[state]
 
 
-def rsi(s: pd.Series, n: int = 14) -> pd.Series:
-    d = s.diff()
-    up = d.clip(lower=0).rolling(n).mean()
-    dn = (-d.clip(upper=0)).rolling(n).mean()
-    return 100 - 100 / (1 + up / dn)
+# ------------------------------------------------------------------ data
+def fred_series(series_id: str, start: str) -> pd.Series:
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    d = pd.read_csv(io.StringIO(r.text), na_values=[".", ""])
+    d.columns = ["date", "value"]
+    d["date"] = pd.to_datetime(d["date"])
+    return d.set_index("date")["value"].astype(float)
 
 
-def make_features(df: pd.DataFrame, horizon: int):
-    X = pd.DataFrame(index=df.index)
-    for c in df.columns:
-        for k in (1, 5, 20):
-            X[f"{c}_ret{k}d"] = df[c].pct_change(k)
-    s = df["Silver"]
-    X["rsi14"] = rsi(s)
-    X["gap_ma20"] = s / s.rolling(20).mean() - 1
-    X["gap_ma50"] = s / s.rolling(50).mean() - 1
-    X["vol20"] = s.pct_change().rolling(20).std()
-    X["gold_silver_ratio"] = df["Gold"] / s if "Gold" in df else np.nan
-    X["weekday"] = df.index.dayofweek
-    future = s.shift(-horizon)
-    y = (future > s).astype(float)
-    y[future.isna()] = np.nan  # last `horizon` days have no answer yet
-    return X, y
+def month_end(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        return df.resample("ME").last()
+    except ValueError:  # older pandas
+        return df.resample("M").last()
 
 
-# ---------------------------------------------------------------- models
-def train_trees(name, Xtr, ytr, Xte):
-    if name == "Random Forest":
-        m = RandomForestClassifier(n_estimators=400, min_samples_leaf=5, n_jobs=-1, random_state=0)
-    else:
-        m = GradientBoostingClassifier(random_state=0)
-    m.fit(Xtr, ytr)
-    return m, m.predict_proba(Xte)[:, 1]
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def load_monthly(start: str) -> pd.DataFrame:
+    px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False)["Close"]
+    px = px.rename(columns={v: k for k, v in YF.items()})
+    fr = pd.concat({k: fred_series(v, start) for k, v in FRED.items()}, axis=1)
+    daily = px.join(fr, how="outer").sort_index().ffill()
+    daily = daily.dropna(subset=["silver"])
+    return month_end(daily).dropna(subset=["silver"])
 
 
-def make_windows(X: np.ndarray, y: np.ndarray, idx_positions, window: int):
-    xs, ys = [], []
-    for p in idx_positions:
-        if p - window + 1 < 0:
-            continue
-        xs.append(X[p - window + 1 : p + 1])
-        ys.append(y[p])
-    return np.array(xs, dtype="float32"), np.array(ys, dtype="float32")
+def build_features(m: pd.DataFrame) -> pd.DataFrame:
+    F = pd.DataFrame(index=m.index)
+    F["real_yield"] = m["real_yield"]
+    F["real_yield_chg"] = m["real_yield"].diff(3)
+    F["breakeven"] = m["breakeven"]
+    F["fed_chg"] = m["fed_funds"].diff(6)
+    F["curve"] = m["curve"]
+    F["dollar_mom"] = m["dollar"].pct_change(3)
+    F["oil_mom"] = m["oil"].pct_change(3).clip(-0.8, 1.5)  # 2020 negative oil price glitch
+    F["copper_mom"] = m["copper"].pct_change(3)
+    F["vix"] = m["vix"]
+    F["spx_mom"] = m["spx"].pct_change(3)
+    F["gs_ratio"] = m["gold"] / m["silver"]
+    return F[list(META)]
 
 
-def build_tcn_lstm(window, n_feat):
-    """TCN-style dilated causal convolutions followed by an LSTM."""
-    from tensorflow import keras
-    from tensorflow.keras import layers
-
-    inp = keras.Input(shape=(window, n_feat))
-    x = inp
-    for d in (1, 2, 4):  # dilated causal conv blocks with residual links
-        h = layers.Conv1D(32, 3, padding="causal", dilation_rate=d, activation="relu")(x)
-        h = layers.SpatialDropout1D(0.2)(h)
-        if x.shape[-1] != 32:
-            x = layers.Conv1D(32, 1)(x)
-        x = layers.Add()([x, h])
-    x = layers.LSTM(32, dropout=0.2)(x)
-    x = layers.Dense(16, activation="relu")(x)
-    out = layers.Dense(1, activation="sigmoid")(x)
-    model = keras.Model(inp, out)
-    model.compile(optimizer="adam", loss="binary_crossentropy")
-    return model
+# ------------------------------------------------------------------ analysis
+def assign_states(F: pd.DataFrame, learn_idx) -> pd.DataFrame:
+    """Low/Mid/High using thresholds learned ONLY on the learn period."""
+    S = pd.DataFrame(index=F.index, columns=F.columns, dtype=object)
+    for c in F.columns:
+        lo, hi = F.loc[learn_idx, c].quantile([1 / 3, 2 / 3])
+        col = F[c]
+        lab = np.where(col <= lo, "Low", np.where(col <= hi, "Mid", "High")).astype(object)
+        S[c] = pd.Series(lab, index=F.index).where(col.notna())
+    return S
 
 
-# ---------------------------------------------------------------- UI
-st.title("🥈 Silver Price Direction Predictor")
-st.caption("Will silver be higher or lower in N trading days? A hands-on version of the research summary.")
+def half_edge(fwd, S, col, state, idx):
+    mask = S.loc[idx, col] == state
+    r = fwd.loc[idx][mask]
+    return r.mean() - fwd.loc[idx].mean() if len(r) >= 4 else np.nan
 
+
+def bucket_stats(S, fwd, idx, h):
+    base = fwd.loc[idx]
+    mid = len(idx) // 2
+    first, second = idx[:mid], idx[mid:]
+    rows = []
+    for c in S.columns:
+        for s in STATES:
+            r = base[S.loc[idx, c] == s]
+            n = len(r)
+            if n < 8:
+                continue
+            sd = r.std()
+            eff_n = max(n / h, 1.0)  # months overlap, so fewer independent observations
+            t = (r.mean() - base.mean()) / (sd / np.sqrt(eff_n)) if sd > 0 else 0.0
+            e1, e2 = half_edge(fwd, S, c, s, first), half_edge(fwd, S, c, s, second)
+            edge = r.mean() - base.mean()
+            consistent = bool(np.sign(e1) == np.sign(e2) == np.sign(edge)) if not (np.isnan(e1) or np.isnan(e2)) else False
+            rows.append(dict(col=c, state=s, n=n, avg=r.mean(), median=r.median(),
+                             win=(r > 0).mean(), edge=edge, t=t, consistent=consistent))
+    return pd.DataFrame(rows)
+
+
+def build_rules(stats, t_thr, need_consistent):
+    ok = stats[(stats["t"].abs() >= t_thr)]
+    if need_consistent:
+        ok = ok[ok["consistent"]]
+    good = {(r.col, r.state) for r in ok.itertuples() if r.edge > 0}
+    bad = {(r.col, r.state) for r in ok.itertuples() if r.edge < 0}
+    return good, bad
+
+
+def score_series(S, good, bad):
+    score = pd.Series(0, index=S.index, dtype=float)
+    for c in S.columns:
+        for s in STATES:
+            if (c, s) in good:
+                score += (S[c] == s).astype(float)
+            if (c, s) in bad:
+                score -= (S[c] == s).astype(float)
+    return score
+
+
+def to_verdict(score, lo_thr, hi_thr):
+    v = pd.Series("Neutral", index=score.index)
+    v[(score >= hi_thr) & (score > 0)] = "Buy-friendly"
+    v[(score <= lo_thr) & (score < 0)] = "Avoid"
+    return v
+
+
+def summarize(fwd, verdict, idx):
+    rows = []
+    for g in ["Buy-friendly", "Neutral", "Avoid", "All months"]:
+        r = fwd.loc[idx] if g == "All months" else fwd.loc[idx].where(verdict.loc[idx] == g).dropna()
+        if len(r) == 0:
+            rows.append(dict(Environment=g, Months=0, Avg=np.nan, Median=np.nan, Win=np.nan))
+        else:
+            rows.append(dict(Environment=g, Months=len(r), Avg=r.mean(), Median=r.median(), Win=(r > 0).mean()))
+    return pd.DataFrame(rows)
+
+
+def fmt_summary(d):
+    o = d.copy()
+    o["Avg"] = o["Avg"].map(lambda v: "-" if pd.isna(v) else f"{v:+.1%}")
+    o["Median"] = o["Median"].map(lambda v: "-" if pd.isna(v) else f"{v:+.1%}")
+    o["Win"] = o["Win"].map(lambda v: "-" if pd.isna(v) else f"{v:.0%}")
+    return o.rename(columns={"Avg": "Avg silver return after", "Median": "Median return after",
+                             "Win": "% of times silver rose"})
+
+
+# ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("Settings")
-    start = st.text_input("Data start date", "2012-01-01")
-    horizon = st.slider("Predict direction N trading days ahead", 1, 60, 20)
-    model_name = st.selectbox(
-        "Model",
-        ["Random Forest", "Gradient Boosting", "TCN-LSTM (deep learning, needs tensorflow)"],
-    )
-    test_frac = st.slider("Share of data held back for testing", 0.1, 0.4, 0.2, 0.05)
-    st.subheader("Trading filter")
-    conf = st.slider("Only go long if P(up) is above", 0.50, 0.80, 0.55, 0.01)
-    use_rsi = st.checkbox("Also require RSI below 70 (avoid overbought)", True)
-    run = st.button("Train & predict", type="primary", use_container_width=True)
+    start = st.text_input("Data start date", "2004-01-01")
+    h = st.select_slider("Look-ahead period (months)", options=[1, 3, 6, 12], value=6)
+    learn_frac = st.slider("Share of history used to LEARN the rules", 0.4, 0.8, 0.6, 0.05)
+    t_thr = st.slider("Minimum strength to count an environment", 0.5, 2.5, 1.0, 0.1,
+                      help="Higher = fewer, but more reliable, rules.")
+    need_consistent = st.checkbox("Require the effect in both halves of the learn period", True)
 
-tab_guide, tab_res, tab_how = st.tabs(["📖 Plain-English guide", "📊 Results", "🛠 How to use it"])
+st.title("🥈 Silver Macro Environment Analyzer")
+st.caption("Which macro conditions have been good or bad for buying silver, and where are we now?")
 
+try:
+    with st.spinner("Downloading market + FRED macro data..."):
+        m = load_monthly(start)
+except Exception as e:
+    st.error(f"Could not download data: {e}")
+    st.stop()
+
+F = build_features(m)
+F_ok = F.dropna()
+fwd = (m["silver"].shift(-h) / m["silver"] - 1).reindex(F_ok.index)
+ev = F_ok.index.intersection(fwd.dropna().index)
+cut = int(len(ev) * learn_frac)
+learn_idx, test_idx = ev[: max(cut - h, 0)], ev[cut:]  # purge h months so no overlap
+
+if len(learn_idx) < 36 or len(test_idx) < 12:
+    st.error("Not enough history. Move the start date earlier or change the learn share.")
+    st.stop()
+
+S = assign_states(F_ok, learn_idx)
+stats = bucket_stats(S, fwd, learn_idx, h)
+good, bad = build_rules(stats, t_thr, need_consistent)
+score = score_series(S, good, bad)
+lo_thr, hi_thr = np.quantile(score.loc[learn_idx], 0.25), np.quantile(score.loc[learn_idx], 0.75)
+verdict = to_verdict(score, lo_thr, hi_thr)
+
+tab_guide, tab_map, tab_rank, tab_test, tab_now = st.tabs(
+    ["📖 Guide", "🗺 Environment map", "🏆 Best vs worst", "🧪 Does it hold up?", "📍 Today"])
+
+# ------------------------------------------------------------------ guide
 with tab_guide:
+    st.markdown(f"""
+### How this works (plain English)
+1. Each month since {start[:4]} is described by **11 macro conditions**: interest rates, inflation expectations,
+   the Fed, the dollar, oil, copper, stocks, fear, and the gold/silver ratio.
+2. Every condition is split into **Low / Neutral / High** (for example "dollar weakening / flat / strengthening").
+3. For each one, we measure what silver did over the **next {h} months**.
+4. Conditions where silver did clearly better than average become **buy-friendly signals**; the clearly worse ones become **avoid signals**.
+5. Adding these up gives a **macro score** for any month, including today.
+6. To stay honest, the rules are learned on the **first {learn_frac:.0%} of history only**, then checked on the
+   remaining months that the rules never saw. That's the **"Does it hold up?"** tab, so look there before trusting anything.
+
+**Tabs:** Environment map = everything at a glance. Best vs worst = the clearest environments.
+Does it hold up? = the out-of-sample test. Today = the current verdict.
+
+⚠️ Educational only, not financial advice. Macro conditions shift the odds slightly; they do not predict silver.
+""")
+
+# ------------------------------------------------------------------ map
+with tab_map:
+    st.subheader(f"Average silver return over the next {h} months, by environment")
+    st.caption("Learn period only. Green = silver tended to rise afterwards, red = tended to fall.")
+    z, txt = [], []
+    for c in META:
+        zr, tr = [], []
+        for s in STATES:
+            r = stats[(stats["col"] == c) & (stats["state"] == s)]
+            if r.empty:
+                zr.append(np.nan); tr.append("")
+            else:
+                zr.append(r["avg"].iloc[0] * 100)
+                tr.append(f"{state_label(c, s)}<br><b>{r['avg'].iloc[0]:+.1%}</b> (n={int(r['n'].iloc[0])})")
+        z.append(zr); txt.append(tr)
+    zmax = np.nanmax(np.abs(z)) if np.isfinite(z).any() else 10
+    fig = go.Figure(go.Heatmap(z=z, x=["Low", "Neutral", "High"], y=[META[c][0] for c in META],
+                               text=txt, texttemplate="%{text}", colorscale="RdYlGn",
+                               zmid=0, zmin=-zmax, zmax=zmax, showscale=False, xgap=3, ygap=3))
+    fig.update_layout(height=640, yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
+    fig.update_traces(textfont_size=11)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ------------------------------------------------------------------ ranking
+def rank_table(df):
+    o = pd.DataFrame({
+        "Environment": [state_label(r.col, r.state) for r in df.itertuples()],
+        "Indicator": [META[r.col][0] for r in df.itertuples()],
+        "Months": df["n"].values,
+        "Avg return after": [f"{v:+.1%}" for v in df["avg"]],
+        "vs. average": [f"{v * 100:+.1f} pts" for v in df["edge"]],
+        "% rose": [f"{v:.0%}" for v in df["win"]],
+        "Strength": [f"{v:+.1f}" for v in df["t"]],
+        "Held in both halves?": ["✅" if v else "❌" for v in df["consistent"]],
+    })
+    return o
+
+
+with tab_rank:
+    cL, cR = st.columns(2)
+    with cL:
+        st.subheader("🟢 Best environments to buy")
+        st.dataframe(rank_table(stats.sort_values("edge", ascending=False).head(6)), hide_index=True, use_container_width=True)
+    with cR:
+        st.subheader("🔴 Environments to avoid")
+        st.dataframe(rank_table(stats.sort_values("edge").head(6)), hide_index=True, use_container_width=True)
+    st.caption(f"'vs. average' = extra silver return compared with the average month ({fwd.loc[learn_idx].mean():+.1%} over {h} months). "
+               "'Strength' ≈ t-statistic; above ±2 is fairly strong, and it is adjusted for overlapping periods. "
+               "With 33 environments tested, a few will look good purely by luck. That is why the next tab matters.")
+    st.markdown(f"**Rules in use** (strength ≥ {t_thr}{', held in both halves' if need_consistent else ''}): "
+                f"{len(good)} buy-friendly, {len(bad)} avoid.")
+    if good or bad:
+        c1, c2 = st.columns(2)
+        c1.markdown("**Buy-friendly:**\n" + "\n".join(f"- {state_label(c, s)}" for c, s in sorted(good)) if good else "None")
+        c2.markdown("**Avoid:**\n" + "\n".join(f"- {state_label(c, s)}" for c, s in sorted(bad)) if bad else "None")
+
+# ------------------------------------------------------------------ out of sample
+with tab_test:
+    if not (good or bad):
+        st.warning("No environment passed the strength filter. Lower the minimum strength in the sidebar.")
+    else:
+        a, b = st.columns(2)
+        a.subheader("Learn period (in-sample)")
+        a.caption(f"{learn_idx[0]:%b %Y} to {learn_idx[-1]:%b %Y}. Rules were built here, so this looks flattering.")
+        a.dataframe(fmt_summary(summarize(fwd, verdict, learn_idx)), hide_index=True, use_container_width=True)
+        b.subheader("Test period (out-of-sample) ✅")
+        b.caption(f"{test_idx[0]:%b %Y} to {test_idx[-1]:%b %Y}. The rules never saw this data. This is the honest result.")
+        tsum = summarize(fwd, verdict, test_idx)
+        b.dataframe(fmt_summary(tsum), hide_index=True, use_container_width=True)
+
+        bar = go.Figure(go.Bar(x=tsum["Environment"], y=tsum["Avg"] * 100,
+                               marker_color=["#2e9e5b", "#9aa0a6", "#d64545", "#4a6fa5"],
+                               text=[f"{v:+.1f}%" if pd.notna(v) else "" for v in tsum["Avg"] * 100], textposition="outside"))
+        bar.update_layout(title=f"Test period: average silver return over the next {h} months", yaxis_title="%", height=360)
+        st.plotly_chart(bar, use_container_width=True)
+
+        tb = tsum.set_index("Environment")
+        if tb.loc["Buy-friendly", "Months"] > 0 and tb.loc["Avoid", "Months"] > 0:
+            spread = (tb.loc["Buy-friendly", "Avg"] - tb.loc["Avoid", "Avg"]) * 100
+            if spread > 2:
+                st.success(f"Out of sample, 'Buy-friendly' months beat 'Avoid' months by {spread:.1f} points. The signal has some support, "
+                           "but the test period is short, so stay cautious.")
+            else:
+                st.warning(f"Out of sample, the gap between 'Buy-friendly' and 'Avoid' is only {spread:.1f} points. "
+                           "The pattern did not hold up well, so don't lean on these rules.")
+        st.caption("Months overlap (each looks {0} months ahead), so the number of truly independent observations is much smaller than the month count.".format(h))
+
+        pl = go.Figure()
+        pl.add_scatter(x=m.index, y=m["silver"], name="Silver", line=dict(color="#888"))
+        for g, col in [("Buy-friendly", "#2e9e5b"), ("Avoid", "#d64545")]:
+            ix = verdict[verdict == g].index
+            pl.add_scatter(x=ix, y=m["silver"].reindex(ix), mode="markers", name=g, marker=dict(color=col, size=6))
+        pl.add_vline(x=test_idx[0], line_dash="dash", annotation_text="test period starts")
+        pl.update_layout(title="Silver with macro verdicts", yaxis_type="log", height=380)
+        st.plotly_chart(pl, use_container_width=True)
+
+# ------------------------------------------------------------------ today
+with tab_now:
+    now = F.dropna().index[-1]
+    cur = F_ok.loc[now]
+    S_now = S.loc[now]
+    v_now, sc_now = verdict.loc[now], int(score.loc[now])
+    icon = {"Buy-friendly": "🟢", "Neutral": "⚪", "Avoid": "🔴"}[v_now]
+    st.subheader(f"{icon} Current macro environment ({now:%b %Y}): {v_now}")
+    st.metric("Macro score", f"{sc_now:+d}", help="Buy-friendly conditions minus avoid conditions.")
+    rows = []
+    for c in META:
+        s = S_now[c]
+        tag = "🟢 buy-friendly" if (c, s) in good else ("🔴 avoid" if (c, s) in bad else "⚪ neutral")
+        val = f"{cur[c]:+.1%}" if META[c][3] else f"{cur[c]:.2f}"
+        rows.append({"Indicator": META[c][0], "Reading": val, "Condition": state_label(c, s), "Effect on silver": tag})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.markdown(
-        """
-### What the documents are saying
-
-**1. Silver's direction is influenced by a few things**
-- **US Dollar**: stronger dollar → silver usually falls; weaker dollar → silver usually rises.
-- **Interest rates**: Fed rate hikes push silver down at first.
-- **Economic growth**: silver is also used in industry, so growth tends to lift it.
-- **Gold, platinum, copper, oil** move together with silver.
-
-**2. Models try to learn those patterns**
-- *Tree models* (Random Forest / XGBoost): lots of "if this, then that" rules voted together. Simple and robust.
-- *Deep learning (TCN-LSTM)*: looks at the last 60 days as a sequence and finds patterns over time. More complex, needs more tuning.
-- *ARIMA*: the old-school baseline.
-
-**3. A filter makes trading signals safer**
-Only act when the model is confident, and skip trades when RSI says silver is already overbought.
-
-### ⚠️ Honest reality check
-The documents quote accuracy of 85-90%, correlations of 99.9%, and 115% returns. **Treat those numbers with
-suspicion.** Such results often come from "leakage" (the model accidentally sees the future) or from
-overlapping data. This app avoids that by testing only on later dates, with a gap of N days between training and
-testing. **Expect something close to 50-60%.** If you see 55%, that is already meaningful. This is
-an educational tool, not financial advice.
-"""
-    )
-
-if run:
-    try:
-        with st.spinner("Downloading market data..."):
-            df = load_data(start)
-    except Exception as e:
-        st.error(f"Could not download data: {e}")
-        st.stop()
-
-    X, y = make_features(df, horizon)
-    valid = X.dropna().index.intersection(y.dropna().index)
-    Xv, yv = X.loc[valid], y.loc[valid]
-    cut = int(len(Xv) * (1 - test_frac))
-    gap = horizon  # purge overlap so training labels never peek into the test period
-    Xtr, ytr = Xv.iloc[: cut - gap], yv.iloc[: cut - gap]
-    Xte, yte = Xv.iloc[cut:], yv.iloc[cut:]
-    latest = X.iloc[[-1]].ffill()
-
-    with st.spinner("Training model..."):
-        if model_name.startswith("TCN"):
-            try:
-                from tensorflow import keras  # noqa: F401
-            except ImportError:
-                st.error("TensorFlow isn't installed. Run `pip install tensorflow` or pick a tree model.")
-                st.stop()
-            window = 60
-            full = X.ffill().bfill()
-            mu, sd = full.iloc[: cut - gap].mean(), full.iloc[: cut - gap].std().replace(0, 1)
-            Z = ((full - mu) / sd).values
-            yfull = y.reindex(full.index).fillna(0).values
-            pos_all = {d: i for i, d in enumerate(full.index)}
-            tr_pos = [pos_all[d] for d in Xtr.index]
-            te_pos = [pos_all[d] for d in Xte.index]
-            Wtr, Ltr = make_windows(Z, yfull, tr_pos, window)
-            Wte, _ = make_windows(Z, yfull, te_pos, window)
-            net = build_tcn_lstm(window, Z.shape[1])
-            net.fit(Wtr, Ltr, epochs=15, batch_size=64, validation_split=0.1, verbose=0)
-            proba = net.predict(Wte, verbose=0).ravel()
-            Xte, yte = Xte.iloc[-len(proba):], yte.iloc[-len(proba):]
-            p_now = float(net.predict(Z[-window:][None], verbose=0)[0, 0])
-            importances = None
-        else:
-            model, proba = train_trees(model_name, Xtr, ytr, Xte)
-            p_now = float(model.predict_proba(latest)[0, 1])
-            importances = pd.Series(model.feature_importances_, index=Xtr.columns).sort_values(ascending=False)
-
-    pred = (proba > 0.5).astype(int)
-    acc = accuracy_score(yte, pred)
-    base = max(yte.mean(), 1 - yte.mean())  # accuracy of always guessing the most common outcome
-
-    # Simple backtest: each day, hold silver if the filter says "go", else stay in cash
-    s = df["Silver"]
-    next_ret = s.pct_change().shift(-1).reindex(Xte.index).fillna(0)
-    go_long = pd.Series(proba > conf, index=Xte.index)
-    if use_rsi:
-        go_long &= Xte["rsi14"] < 70
-    strat = (1 + next_ret * go_long.astype(float)).cumprod()
-    hold = (1 + next_ret).cumprod()
-
-    with tab_res:
-        st.subheader(f"Latest signal ({df.index[-1].date()})")
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"P(silver higher in {horizon} days)", f"{p_now:.0%}")
-        rsi_now = float(latest["rsi14"].iloc[0])
-        action = "🟢 Lean UP" if p_now > conf and (not use_rsi or rsi_now < 70) else (
-            "🔴 Lean DOWN / stay out" if p_now < 1 - conf + 0.0 or p_now < 0.5 else "⚪ No clear signal")
-        c2.metric("Signal", action)
-        c3.metric("RSI (14)", f"{rsi_now:.0f}")
-
-        st.subheader("How well did it do on data it had never seen?")
-        a, b, c = st.columns(3)
-        a.metric("Model direction accuracy", f"{acc:.1%}")
-        b.metric("Naive guess (always same answer)", f"{base:.1%}")
-        c.metric("Edge over naive guess", f"{(acc - base) * 100:+.1f} pts")
-        if acc - base < 0.02:
-            st.info("The model barely beats a naive guess. That's normal for markets, and it's the honest result.")
-
-        fig = go.Figure()
-        fig.add_scatter(x=hold.index, y=hold, name="Buy & hold silver")
-        fig.add_scatter(x=strat.index, y=strat, name="Model strategy (with filter)")
-        fig.update_layout(title="Test-period growth of 1 unit (no fees or slippage)", height=380)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"Strategy was in the market {go_long.mean():.0%} of days.")
-
-        st.subheader("Silver price")
-        st.line_chart(s)
-
-        if importances is not None:
-            st.subheader("What the model paid most attention to")
-            st.bar_chart(importances.head(12))
-
-    with tab_how:
-        st.markdown(
-            f"""
-### How to use this model, step by step
-1. **Pick a horizon** (default 20 days, as in the research) and click **Train & predict**.
-2. **Check the accuracy first.** If it isn't above the "naive guess", don't trust the signal.
-3. **Read the latest signal.** Currently P(up in {horizon} days) = **{p_now:.0%}**.
-   Above {conf:.0%} with RSI < 70 → lean up. Weak or mixed → do nothing.
-4. **Retrain regularly** (weekly or monthly) because market behaviour changes.
-5. **Never use it alone.** Combine it with news, the dollar trend and rate decisions, and
-   size positions so that a wrong call is affordable.
-6. To improve it: add more features (inflation expectations, real interest rates), tune hyperparameters, and
-   compare Random Forest vs TCN-LSTM on the same test period.
-"""
-        )
-else:
-    with tab_res:
-        st.info("Set your options in the sidebar and click **Train & predict**.")
-    with tab_how:
-        st.info("Run the model first. This tab will then show how to read the result.")
+        f"**How to use this:** a {v_now.lower()} reading tilts the odds only slightly. Use it as a *background filter*: "
+        "be more willing to add silver when conditions are buy-friendly, and more patient when they say avoid. "
+        "Check the 'Does it hold up?' tab first, rebuild the analysis every few months, and size positions so being wrong is affordable.")
+    st.caption("Latest values can lag a few days (FRED publishes with a delay). Not financial advice.")
