@@ -17,6 +17,7 @@ v3.1: parallel downloads; no progress callbacks inside cached functions.
 """
 import io
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -173,32 +174,10 @@ def month_end(df):
         return df.resample("M").last()
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def load_raw(pre, key):
-    """Yahoo + all FRED series downloaded in parallel. Exceptions from Yahoo are not cached."""
-    with ThreadPoolExecutor(max_workers=len(FRED) + 1) as ex:
-        fy = ex.submit(_yahoo_fetch, pre)
-        ff = {k: ex.submit(_fred_fetch, v, pre, key) for k, v in FRED.items()}
-        px = fy.result()
-        fr, failed = {}, []
-        for k, f in ff.items():
-            try:
-                fr[k] = f.result()
-            except Exception:  # noqa: BLE001
-                failed.append(k)
-    return px, fr, failed
+DATA_START = "1990-01-01"  # always download the full history once; the sidebar start date only slices it
 
 
-def load_monthly(start, cb=None):
-    cb = cb or (lambda f, t: None)
-    pre = (pd.Timestamp(start) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")  # warm-up history for rolling stats
-    cb(0.05, "Downloading market + macro data in parallel (first run only, then cached)...")
-    px, fr, failed = load_raw(pre, get_fred_key())
-    if failed or px.empty:
-        load_raw.clear()  # don't keep a partial result for 6 hours; retry next run
-    if "real_yield" in failed:  # FRED host is down: fall back to Yahoo stand-ins
-        fr, failed = {}, list(FRED)
-
+def _prepare_monthly(px, fr, failed):
     def lag(s, days):
         return s.set_axis(s.index + pd.DateOffset(months=1) + pd.Timedelta(days=days))
 
@@ -210,10 +189,30 @@ def load_monthly(start, cb=None):
                 fr["cpi_level"] = lag(raw, 20)
     if "nfci" in fr:  # weekly, published with a short delay
         fr["nfci"] = fr["nfci"].set_axis(fr["nfci"].index + pd.Timedelta(days=7))
-    cb(0.35, "Preparing monthly data...")
     daily = px.join(pd.concat(fr, axis=1), how="outer") if fr else px
     daily = daily.sort_index().ffill().dropna(subset=["silver"])
     return month_end(daily).dropna(subset=["silver"]), sorted(set(failed))
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def get_dataset(key):
+    """Download EVERYTHING once (Yahoo + all FRED series in parallel), build monthly data and features, and cache it.
+    Changing any setting afterwards (start date, indicators, look-ahead, model, strategy...) reuses this.
+    Exceptions are not cached, so a total failure is retried on the next run."""
+    with ThreadPoolExecutor(max_workers=len(FRED) + 1) as ex:
+        fy = ex.submit(_yahoo_fetch, DATA_START)
+        ff = {k: ex.submit(_fred_fetch, v, DATA_START, key) for k, v in FRED.items()}
+        px = fy.result()
+        fr, failed = {}, []
+        for k, f in ff.items():
+            try:
+                fr[k] = f.result()
+            except Exception:  # noqa: BLE001
+                failed.append(k)
+    if "real_yield" in failed:  # FRED host is down: fall back to Yahoo stand-ins
+        fr, failed = {}, list(FRED)
+    m, failed = _prepare_monthly(px, fr, failed)
+    return m, build_features(m), failed, time.time()
 
 
 def exp_pctl(s, minp=36):
@@ -356,7 +355,7 @@ def to_verdict(score, lo_thr, hi_thr):
     return v
 
 
-def summarize(fwd, groups, idx, h, fdd=None, order=(FAV, NEU, UNF)):
+def _summarize(fwd, groups, idx, h, fdd=None, order=(FAV, NEU, UNF)):
     rows = []
     for g_ in list(order) + ["All months"]:
         r = fwd.loc[idx] if g_ == "All months" else fwd.loc[idx].where(groups.reindex(idx) == g_).dropna()
@@ -369,6 +368,16 @@ def summarize(fwd, groups, idx, h, fdd=None, order=(FAV, NEU, UNF)):
                 row["DD"] = fdd.reindex(r.index).median()
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def _summarize_c(fwd, groups, idx_vals, h, fdd, order):
+    return _summarize(fwd, groups, pd.DatetimeIndex(idx_vals), h, fdd, order)
+
+
+def summarize(fwd, groups, idx, h, fdd=None, order=(FAV, NEU, UNF)):
+    """Cached (index passed as a plain array because Streamlit cannot hash a pandas Index)."""
+    return _summarize_c(fwd, groups, pd.DatetimeIndex(idx).values, h, fdd, tuple(order))
 
 
 def pc(v, plus=True):
@@ -423,13 +432,23 @@ def split_idx(F_ok, fwd, h, learn_frac):
     return ev, cut, ev[: max(cut - h, 0)], ev[cut:]  # purge h months: no learn/test overlap
 
 
-def run_rules(F_ok, fwd, learn_idx, h, t_thr, need_consistent):
+def _run_rules(F_ok, fwd, learn_idx, h, t_thr, need_consistent):
     S = assign_states(F_ok, learn_idx)
     stats = bucket_stats(S, fwd, learn_idx, h)
     good, bad = build_rules(stats, t_thr, need_consistent)
     score = score_series(S, good, bad)
     lo, hi = np.quantile(score.loc[learn_idx], 0.25), np.quantile(score.loc[learn_idx], 0.75)
     return S, stats, good, bad, score, to_verdict(score, lo, hi)
+
+
+@st.cache_data(show_spinner=False)
+def _run_rules_c(F_ok, fwd, learn_vals, h, t_thr, need_consistent):
+    return _run_rules(F_ok, fwd, pd.DatetimeIndex(learn_vals), h, t_thr, need_consistent)
+
+
+def run_rules(F_ok, fwd, learn_idx, h, t_thr, need_consistent):
+    """Cached. (Streamlit cannot hash a pandas Index, so it is passed as a plain array.)"""
+    return _run_rules_c(F_ok, fwd, pd.DatetimeIndex(learn_idx).values, h, t_thr, need_consistent)
 
 
 def rank_ic(a, b):
@@ -447,7 +466,7 @@ def hl_spread(fwd, S, c, idx):
     return (hi.mean() - lo.mean()) * 100 if len(hi) >= 4 and len(lo) >= 4 else np.nan
 
 
-def indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h):
+def _indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h):
     """Rank-correlation of each indicator with the future outcome, on learn and on unseen (test) data."""
     rows = []
     for c in F_ok.columns:
@@ -476,6 +495,16 @@ def indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h):
     d = pd.DataFrame(rows)
     d["absl"] = d["ic_l"].abs()
     return d.sort_values(["reliab", "absl"], ascending=False, na_position="last").drop(columns="absl").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
+def _indicator_ranking_c(F_ok, fwd, S, learn_vals, test_vals, h):
+    return _indicator_ranking(F_ok, fwd, S, pd.DatetimeIndex(learn_vals), pd.DatetimeIndex(test_vals), h)
+
+
+def indicator_ranking(F_ok, fwd, S, learn_idx, test_idx, h):
+    return _indicator_ranking_c(F_ok, fwd, S, pd.DatetimeIndex(learn_idx).values, pd.DatetimeIndex(test_idx).values, h)
 
 
 def ic_by_horizon(m, F_ok, target, learn_frac):
@@ -731,6 +760,14 @@ def run_backtest_w(m, W, bps):
     return ret.dropna(), turn
 
 
+@st.cache_data(show_spinner=False)
+def bt_one(m, v, trend, strat, bps):
+    """One strategy on one signal: returns (monthly returns, number of trades, average % invested)."""
+    W = strategy_weights(strat, v, trend)
+    ret, turn = run_backtest_w(m, W, bps)
+    return ret, int((turn > 0).sum()), (W["silver"] + W["gold"]).reindex(ret.index).mean()
+
+
 def perf(r, rf, invested=np.nan, trades=np.nan):
     keys = ["CAGR", "Volatility", "Sharpe", "Sortino", "Calmar", "Max drawdown"]
     n = len(r)
@@ -778,6 +815,8 @@ def growth_chart(curves, common, title):
 # ================================================================== UI
 with st.sidebar:
     st.header("Settings")
+    if st.button("🔄 Refresh data", help="Data is downloaded once and reused for 6 hours. Click to download again now."):
+        get_dataset.clear()
     start = st.text_input("Data start date", "2004-01-01")
     target_name = st.selectbox("What to predict", list(TARGETS), help="Relative targets ask whether silver BEATS gold / cash.")
     target = TARGETS[target_name]
@@ -809,16 +848,28 @@ def cb(frac, text):
 
 
 try:
-    m, failed = load_monthly(start, cb)
+    cb(0.05, "Loading data (downloaded once, then reused)...")
+    m, F_full, failed, data_ts = get_dataset(get_fred_key())
+    if failed and time.time() - data_ts > 300:  # partial download: retry, but not on every click
+        get_dataset.clear()
+        m, F_full, failed, data_ts = get_dataset(get_fred_key())
 except Exception as e:
     bar.empty()
     st.error(f"Could not download market data: {e}")
     st.stop()
 
-F_all = build_features(m).loc[start:]
+try:
+    F_all = F_full.loc[start:]  # the start date only slices the cached data, it never re-downloads
+except Exception:  # noqa: BLE001
+    F_all = F_full.iloc[0:0]
+if F_all.empty:
+    bar.empty()
+    st.error("The start date is invalid or after the last available data. Use a format like 2004-01-01.")
+    st.stop()
 available = list(F_all.columns)
 default = [c for c in available if c in CORE or c.startswith("nom_")] or available
 with st.sidebar:
+    st.caption(f"Data through {m.index[-1]:%b %Y}, downloaded {(time.time() - data_ts) / 60:.0f} min ago. Changing settings reuses it.")
     st.subheader("Indicators")
     chosen = st.multiselect("Indicators to use", available, default=default, format_func=lambda c: META_ALL[c][0],
                             help="Core set is on by default. More indicators means more chances for a fluke.")
@@ -1132,10 +1183,9 @@ with T["bt"]:
         curves, rows = {}, []
         pairs = [("Trend only (no macro signal)", next(iter(src.values())))] if mode in NO_SIGNAL else list(src.items())
         for sname, v_ in pairs:
-            W = strategy_weights(mode, v_, trend)
-            ret, turn = run_backtest_w(m, W, bps)
+            ret, ntr, inv = bt_one(m, v_, trend, mode, bps)
             curves[sname] = ret
-            rows.append((sname, perf(ret, rf_all, (W["silver"] + W["gold"]).reindex(ret.index).mean(), int((turn > 0).sum()))))
+            rows.append((sname, perf(ret, rf_all, inv, ntr)))
         for bname, bret in bench_curves(m, bt_idx).items():
             curves[bname] = bret
             is_cash = bname.startswith("Cash")
@@ -1153,13 +1203,11 @@ with T["bt"]:
                 for strat in STRATEGIES:
                     if strat in NO_SIGNAL and sname != first_src:
                         continue
-                    W = strategy_weights(strat, v_, trend)
-                    ret, turn = run_backtest_w(m, W, bps)
+                    ret, ntr, inv = bt_one(m, v_, trend, strat, bps)
                     if len(ret) < 12:
                         continue
                     half = len(ret) // 2
-                    inv = (W["silver"] + W["gold"]).reindex(ret.index).mean()
-                    p_all = perf(ret, rf_all, inv, int((turn > 0).sum()))
+                    p_all = perf(ret, rf_all, inv, ntr)
                     p1, p2 = perf(ret.iloc[:half], rf_all), perf(ret.iloc[half:], rf_all)
                     lab = "No macro signal" if strat in NO_SIGNAL else sname
                     key_ = f"{lab} · {strat}"
