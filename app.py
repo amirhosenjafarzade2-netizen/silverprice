@@ -1,28 +1,35 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v4.0
+Silver Macro Environment Analyzer (Streamlit), v4.3
 
 Which macro environments have been historically favorable / unfavorable for silver (and gold), what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
 
 requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn
-Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access.
+Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access (and for first-release / ALFRED data).
 Educational only, not financial advice.
 
-v4.0 changes (methodology review):
-- THREE-way split: learn -> validation -> final test. All selection (strategy, signal source) happens on validation;
-  the final test is only used to grade the locked choice. The leaderboard ranks on validation and shows the final test next to it.
-- Backtest no longer stops h months early (walk-forward ML now also predicts the most recent months).
-- Explicit publication lag per FRED series (PUB_LAG). Revisions are still not modelled (see Guide).
-- Multiple testing: Benjamini-Hochberg q-values, optional FDR rule selection, expected-false-positive count.
-- Randomization test (circular signal shifts), no-timing baseline with the same average exposure, 60/40 baseline, cost stress,
-  parameter-sensitivity grid, rolling indicator IC, rolling Sharpe, correlation/redundancy map.
-- Indicator ablation ("does it add value?"), AUC confidence intervals, hit-rate confidence intervals, honest column names.
-- Point-in-time (expanding percentile) state definitions as an alternative to fixed terciles; optional strength weighting.
-- New data: Baa credit spread, Sahm gauge (unemployment), Philly Fed factory survey, CPI acceleration. Growth regime no longer uses stocks.
-- ETF implementation (SLV / GLD) in the backtest, volatility-capped strategy, regime transitions, analogue paths,
-  history explorer, "what would change the signal", confidence panel (agreement + evidence), monetary vs industrial silver score.
+v4.3 changes (second methodology review):
+- LOCKED MODE REALLY LOCKS. While the final test is revealed, every setting widget is disabled. To change anything you must untick
+  "reveal", which hides the final test again. The peek counter now also covers vintage data, factor mode, auto-horizon and leaderboard settings.
+- FACTOR COMPRESSION (optional). Correlated indicators (average-linkage |Spearman| >= threshold, measured on the early part of the learn
+  period only, no outcomes involved) are merged into one factor = average of sign-aligned z-scores. Uncorrelated indicators stay as they are.
+  This attacks the "many indicators vote for the same story" problem that FDR does not solve.
+- PREDICTIVE ANALOGUES. Besides the descriptive 10-closest-months table, every unseen month now searches ONLY months whose outcome was already
+  known at that time. Scored on unseen months, and available as a backtest signal ("Analogues (expanding)").
+- TWO DRAWDOWN TARGETS. "Avoids a deep drawdown (yes / no)" (classification) and "Forward max drawdown (continuous)" (keeps the magnitude).
+- MORE POINT-IN-TIME DATA. First-release (ALFRED) values now also cover the Philly Fed survey and NFCI (needs a FRED key). It is ON by default when a key exists.
+- CFTC release dates are computed from the Tuesday as-of date plus the Friday release, pushed past US federal holidays and weekends
+  (the CFTC API does not return a publication date), instead of a flat +3 days.
+- Futures mode now carries an explicit warning (continuous front-month series, roll gaps inside returns). ETF stays the default.
+  ETF fees need no extra deduction: SLV / GLD prices are NAV-based and already net of their expense ratios.
+
+v4.2 changes: research vs locked evaluation modes with a peek counter, expanding-window rules, evidence channels instead of independent views,
+optional first-release data for M2 / CPI / industrial production / unemployment, T-bill collateral on futures, compounded cash, shrunk strength weights.
+v4.1 changes: risk-aware targets, risk-adjusted indicator ranking, optional supply / demand / positioning proxies.
 """
+import hashlib
 import io
+import json
 import math
 import os
 import time
@@ -34,6 +41,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -49,18 +57,35 @@ VICON = {1: "🟢", 0: "⚪", -1: "🔴"}
 FRED = {"real_yield": "DFII10", "breakeven": "T10YIE", "fed_funds": "DFF", "curve": "T10Y2Y",
         "m2": "M2SL", "cpi": "CPIAUCSL", "indpro": "INDPRO", "nfci": "NFCI",
         "credit": "BAA10Y", "unrate": "UNRATE", "philly": "GACDFSA066MSFRBPHI"}
+# Series that get revised and therefore can use first-release (ALFRED) values when a FRED key is present.
+VINT_KEYS = ("m2", "cpi", "indpro", "unrate", "philly", "nfci")
 # Monthly series are only usable after publication: (months, days) added to the observation date.
-# Revisions are NOT modelled (M2, INDPRO and UNRATE get revised; CPI and Baa spread are not). Use ALFRED vintages for a stricter test.
-PUB_LAG = {"m2": (1, 20), "cpi": (1, 20), "indpro": (1, 20), "unrate": (1, 10), "philly": (0, 21)}
+# With 'First-release (ALFRED) data' on (needs a FRED key) the real release date is used when it looks sane; otherwise these approximate lags apply.
+PUB_LAG = {"m2": (1, 20), "cpi": (1, 20), "indpro": (1, 20), "unrate": (1, 10), "philly": (0, 21), "nfci": (0, 7)}
 YF = {"silver": "SI=F", "gold": "GC=F", "dollar": "DX-Y.NYB", "oil": "CL=F", "copper": "HG=F",
-      "vix": "^VIX", "spx": "^GSPC", "tnx": "^TNX", "irx": "^IRX", "pl": "PL=F", "slv": "SLV", "gld": "GLD"}
+      "vix": "^VIX", "spx": "^GSPC", "tnx": "^TNX", "irx": "^IRX", "pl": "PL=F", "slv": "SLV", "gld": "GLD",
+      "sil": "SIL", "tan": "TAN"}
+# CFTC Commitments of Traders (Socrata API). Silver = COMEX contract code 084691. Tried in order; failure is non-fatal.
+COT_DATASETS = ("72hh-3qpy", "kh3c-gbw2")
+COT_CODE = "084691"
+COT_LAG_DAYS = 3  # positions are as of Tuesday, published Friday (pushed later around US federal holidays)
 HORIZONS = (1, 2, 3, 6, 9, 12)
 DECAY_HORIZONS = (1, 2, 3, 6, 9, 12, 18, 24)
 ML_MODELS = ["Logistic regression", "Random Forest", "Gradient Boosting"]
-TARGETS = {"Silver's return": "ret", "Silver minus gold (relative)": "gold", "Silver minus cash (T-bills)": "cash"}
-PILLARS = ["Monetary", "Dollar", "Industrial & growth", "Liquidity & risk", "Gold & valuation"]
+TARGETS = {"Silver's return": "ret",
+           "Silver, volatility-scaled forward return": "vol",
+           "Silver avoids a deep drawdown (yes / no)": "ddb",
+           "Silver's forward max drawdown (continuous, vs 15% floor)": "dd",
+           "Silver minus gold (relative)": "gold",
+           "Silver minus cash (T-bills)": "cash"}
+RISK_TARGETS = ("vol", "dd", "ddb")
+PILLARS = ["Monetary", "Dollar", "Industrial & growth", "Liquidity & risk", "Gold & valuation", "Supply, demand & positioning"]
+SDP = "Supply, demand & positioning"
 STATES = ["Low", "Mid", "High"]
 VOL_TARGET = 0.30
+DD_FLOOR = 0.15  # "dd" / "ddb" targets: good when the forward max drawdown is shallower than this
+RULE_STEP = 6  # months between refits of the expanding-window rules
+ANA_K = 10  # analogues used per month in the predictive analogue test
 
 STRATEGIES = [
     "Scaled: 100% / 50% / 0%",
@@ -82,6 +107,9 @@ NOW_PHRASE = {"ret": "silver is higher", "goldabs": "gold is higher", "gold": "s
 REL_TXT = {"Favorable": "Favors silver over gold", "Leaning favorable": "Leans toward silver",
            "Neutral": "No clear preference", "Leaning unfavorable": "Leans toward gold",
            "Unfavorable": "Favors gold over silver"}
+TGT_TXT = {"ret": "silver is higher", "vol": "silver's volatility-scaled forward return is positive",
+           "dd": f"silver avoids a {DD_FLOOR:.0%}+ drawdown", "ddb": f"silver avoids a {DD_FLOOR:.0%}+ drawdown",
+           "gold": "silver beats gold", "cash": "silver beats cash"}
 
 # indicator -> (title, label when LOW, label when HIGH, is a % change?, pillar)
 META_ALL = {
@@ -113,10 +141,13 @@ META_ALL = {
     "val_real":       ("Silver price vs CPI-adjusted history (percentile)", "Low vs its own history", "High vs its own history", False, "Gold & valuation"),
     "nom_yield":      ("10y Treasury yield (level)", "Low yields", "High yields", False, "Monetary"),
     "nom_yield_chg":  ("10y Treasury yield, 3-month change", "Yields falling", "Yields rising", False, "Monetary"),
+    "cot_net":        ("Speculative positioning (CFTC managed-money net, % of open interest)", "Light speculative positioning", "Crowded speculative longs", False, SDP),
+    "miners_rel":     ("Silver miners (SIL) vs silver, 3-month relative", "Miners lagging silver", "Miners outperforming silver", True, SDP),
+    "solar_mom":      ("Solar stocks (TAN), 3-month trend (industrial-demand proxy)", "Solar stocks falling", "Solar stocks rising", True, SDP),
 }
 CORE = ["real_yield", "real_yield_chg", "breakeven", "fed_chg", "curve", "dollar_mom", "oil_mom", "copper_mom",
         "vix", "spx_mom", "gs_ratio", "m2_yoy", "nfci", "sg_mom", "val_real", "credit", "sahm", "philly"]
-META = dict(META_ALL)  # narrowed to indicators in use once data loads
+META = dict(META_ALL)  # narrowed to indicators in use once data loads (factor entries are added to META_ALL at run time)
 # (indicator, sign): growth is NOT measured with stocks any more (stocks are risk appetite, not growth)
 GROWTH = [("copper_mom", 1), ("indpro_yoy", 1), ("philly", 1), ("sahm", -1)]
 INFL = [("cpi_yoy", 1), ("breakeven", 1), ("oil_mom", 1)]
@@ -138,6 +169,29 @@ def show_plot(box, f):
         box.plotly_chart(f, width="stretch")
     except Exception:  # noqa: BLE001
         box.plotly_chart(f, use_container_width=True)
+
+
+PEEK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else ".", ".final_test_peeks.json")
+
+
+def register_peek(sig):
+    """Count how many DISTINCT sets of settings have been shown the final test (persisted next to the app, session fallback)."""
+    h_ = hashlib.md5(sig.encode()).hexdigest()
+    try:
+        with open(PEEK_FILE) as f:
+            seen = json.load(f)
+    except Exception:  # noqa: BLE001
+        seen = list(st.session_state.get("peeks", []))
+    new = h_ not in seen
+    if new:
+        seen = seen + [h_]
+        st.session_state["peeks"] = seen
+        try:
+            with open(PEEK_FILE, "w") as f:
+                json.dump(seen, f)
+        except Exception:  # noqa: BLE001
+            pass
+    return len(seen), new
 
 
 def card(box):
@@ -199,6 +253,51 @@ def _fred_fetch(series_id, start, key):
     raise last
 
 
+def _cot_release_dates(dates):
+    """Release date of each COT report. The API gives only the Tuesday as-of date, so the release is computed: Friday of that week,
+    one business day later if a US federal holiday falls between the Monday of the report week and that Friday (conservative), and rolled
+    forward past weekends / holidays. Conservative means never earlier than the real release, so no look-ahead."""
+    try:
+        hol = USFederalHolidayCalendar().holidays(start=dates.min() - pd.Timedelta(days=10),
+                                                  end=dates.max() + pd.Timedelta(days=20)).values.astype("datetime64[D]")
+        d0 = dates.values.astype("datetime64[D]")
+        fri = d0 + np.timedelta64(COT_LAG_DAYS, "D")
+        mon = d0 - np.timedelta64(1, "D")
+        delay = np.array([bool(((hol >= a) & (hol <= b)).any()) for a, b in zip(mon, fri)]).astype("int64").astype("timedelta64[D]")
+        return pd.DatetimeIndex(np.busday_offset(fri + delay, 0, roll="forward", holidays=hol))
+    except Exception:  # noqa: BLE001
+        return pd.DatetimeIndex(dates) + pd.Timedelta(days=COT_LAG_DAYS)
+
+
+def _cot_fetch(start):
+    """Managed-money net position in COMEX silver as % of open interest (weekly), indexed by an estimated release date.
+    Plain function (no Streamlit calls). Tries each known CFTC dataset id; raises if none works."""
+    last = None
+    for ds in COT_DATASETS:
+        try:
+            r = requests.get(f"https://publicreporting.cftc.gov/resource/{ds}.json", timeout=(5, 30),
+                             params={"$where": f"cftc_contract_market_code='{COT_CODE}' AND report_date_as_yyyy_mm_dd >= '{start}T00:00:00.000'",
+                                     "$select": "report_date_as_yyyy_mm_dd,m_money_positions_long_all,m_money_positions_short_all,open_interest_all",
+                                     "$order": "report_date_as_yyyy_mm_dd", "$limit": 50000})
+            r.raise_for_status()
+            d = pd.DataFrame(r.json())
+            if d.empty:
+                raise ValueError("empty COT response")
+            d["date"] = pd.to_datetime(d["report_date_as_yyyy_mm_dd"])
+            for c in ("m_money_positions_long_all", "m_money_positions_short_all", "open_interest_all"):
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+            s = ((d["m_money_positions_long_all"] - d["m_money_positions_short_all"]) / d["open_interest_all"] * 100)
+            s.index = _cot_release_dates(pd.DatetimeIndex(d["date"]))
+            s = s.dropna()
+            s = s[~s.index.duplicated(keep="last")].sort_index()
+            if len(s) < 100:
+                raise ValueError("too few COT observations")
+            return s.astype(float)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise last
+
+
 def _yahoo_fetch(start):
     px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False, threads=True)["Close"]
     return px.rename(columns={v: k for k, v in YF.items()})
@@ -214,24 +313,35 @@ def month_end(df):
 DATA_START = "1990-01-01"  # always download the full history once; the sidebar start date only slices it
 
 
-def _lag(s, months, days):
-    return s.set_axis(s.index + pd.DateOffset(months=months) + pd.Timedelta(days=days))
+def _avail(s, k, rel):
+    """Re-index an observation-dated series by the date each value became available.
+    With first-release data the real release date is used when it looks sane (0-150 days after the observation); otherwise the PUB_LAG rule."""
+    months, days = PUB_LAG[k]
+    lagged = (s.index + pd.DateOffset(months=months) + pd.Timedelta(days=days)).values
+    idx = lagged
+    if k in rel:
+        rv = rel[k].reindex(s.index).values
+        ok = (~pd.isna(rv)) & (rv >= s.index.values) & (rv <= (s.index + pd.Timedelta(days=150)).values)
+        idx = np.where(ok, rv, lagged)
+    out = pd.Series(s.values, index=pd.DatetimeIndex(idx))
+    return out[~out.index.duplicated(keep="last")].sort_index()
 
 
-def _prepare_monthly(px, fr, failed):
+def _prepare_monthly(px, fr, failed, rel=None):
+    rel = rel or {}
     for k in ("m2", "cpi", "indpro"):  # monthly series: only usable after publication
         if k in fr:
             raw = fr.pop(k)
-            fr[k + "_yoy"] = _lag(raw.pct_change(12) * 100, *PUB_LAG[k]).dropna()
+            fr[k + "_yoy"] = _avail(raw.pct_change(12) * 100, k, rel).dropna()
             if k == "cpi":
-                fr["cpi_level"] = _lag(raw, *PUB_LAG[k])
+                fr["cpi_level"] = _avail(raw, k, rel)
     if "unrate" in fr:  # Sahm gauge: 3-month average unemployment minus its minimum over the previous 12 months
         ma3 = fr.pop("unrate").rolling(3).mean()
-        fr["sahm"] = _lag(ma3 - ma3.shift(1).rolling(12).min(), *PUB_LAG["unrate"]).dropna()
+        fr["sahm"] = _avail(ma3 - ma3.shift(1).rolling(12).min(), "unrate", rel).dropna()
     if "philly" in fr:
-        fr["philly"] = _lag(fr["philly"], *PUB_LAG["philly"])
-    if "nfci" in fr:  # weekly, published with a short delay
-        fr["nfci"] = fr["nfci"].set_axis(fr["nfci"].index + pd.Timedelta(days=7))
+        fr["philly"] = _avail(fr["philly"], "philly", rel).dropna()
+    if "nfci" in fr:  # weekly, published with a short delay; first-release values when available
+        fr["nfci"] = _avail(fr["nfci"], "nfci", rel).dropna()
     daily = px.join(pd.concat(fr, axis=1), how="outer") if fr else px
     daily = daily.sort_index().ffill().dropna(subset=["silver"])
     return month_end(daily).dropna(subset=["silver"]), sorted(set(failed))
@@ -244,23 +354,63 @@ def exp_pctl(s, minp=36):
     return p.reindex(s.index)
 
 
+@st.cache_data(show_spinner=False)
+def pit_percentiles(F_src):
+    return F_src.apply(exp_pctl)
+
+
+def _fred_vintage(series_id, start, key):
+    """First-release values and release dates (FRED output_type=4: initial release only). Returns (values by observation date, release dates).
+    Observations older than the first archived vintage carry that earliest archived value (already revised); the sanity check in _avail then falls back to PUB_LAG."""
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations", timeout=(5, 60),
+                     params=dict(series_id=series_id, api_key=key, file_type="json", observation_start=start,
+                                 realtime_start="1776-07-04", realtime_end="9999-12-31", output_type=4))
+    r.raise_for_status()
+    d = pd.DataFrame(r.json()["observations"])
+    d["date"] = pd.to_datetime(d["date"])
+    d["rel"] = pd.to_datetime(d["realtime_start"], errors="coerce")
+    d["value"] = pd.to_numeric(d["value"], errors="coerce")
+    d = d.dropna(subset=["value"]).drop_duplicates("date", keep="first").set_index("date").sort_index()
+    return d["value"].astype(float), d["rel"]
+
+
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
-def get_dataset(key):
-    """Download EVERYTHING once (Yahoo + all FRED series in parallel), build monthly data and features, and cache it.
+def get_dataset(key, vintage=False):
+    """Download EVERYTHING once (Yahoo + all FRED series + CFTC in parallel), build monthly data and features, and cache it.
+    vintage=True (needs a FRED key) uses first-release values and release dates for M2, CPI, industrial production, unemployment, Philly Fed and NFCI.
     Exceptions are not cached, so a total failure is retried on the next run."""
-    with ThreadPoolExecutor(max_workers=len(FRED) + 1) as ex:
+    vint_keys = VINT_KEYS if (vintage and key) else ()
+    with ThreadPoolExecutor(max_workers=len(FRED) + 2) as ex:
         fy = ex.submit(_yahoo_fetch, DATA_START)
-        ff = {k: ex.submit(_fred_fetch, v, DATA_START, key) for k, v in FRED.items()}
+        ff = {k: ex.submit(_fred_vintage if k in vint_keys else _fred_fetch, v, DATA_START, key) for k, v in FRED.items()}
+        fc = ex.submit(_cot_fetch, DATA_START)
         px = fy.result()
-        fr, failed = {}, []
+        fr, rel, failed = {}, {}, []
         for k, f in ff.items():
             try:
-                fr[k] = f.result()
+                res_ = f.result()
+                if k in vint_keys:
+                    fr[k], rel[k] = res_
+                else:
+                    fr[k] = res_
             except Exception:  # noqa: BLE001
-                failed.append(k)
+                if k in vint_keys:  # fall back to latest-revised data for this series
+                    try:
+                        fr[k] = _fred_fetch(FRED[k], DATA_START, key)
+                    except Exception:  # noqa: BLE001
+                        failed.append(k)
+                else:
+                    failed.append(k)
+        try:
+            cot = fc.result()
+        except Exception:  # noqa: BLE001
+            cot = None
+            failed.append("cot")
     if "real_yield" in failed:  # FRED host is down: fall back to Yahoo stand-ins
-        fr, failed = {}, list(FRED)
-    m, failed = _prepare_monthly(px, fr, failed)
+        fr, failed = {}, list(FRED) + (["cot"] if cot is None else [])
+    if cot is not None:
+        fr["cot"] = cot
+    m, failed = _prepare_monthly(px, fr, failed, rel)
     F = build_features(m)
     P = F.apply(exp_pctl)
     return m, F, P, failed, time.time()
@@ -304,10 +454,58 @@ def build_features(m):
     F["sg_mom"] = (g("silver") / g("gold")).pct_change(3)
     cpi = g("cpi_level")
     F["val_real"] = exp_pctl(g("silver") / cpi if cpi.notna().any() else g("silver"))
-    keep = [c for c in META_ALL if F[c].notna().any()]
+    F["cot_net"] = g("cot")
+    F["miners_rel"] = (g("sil") / g("silver")).pct_change(3)
+    F["solar_mom"] = g("tan").pct_change(3)
+    keep = [c for c in META_ALL if c in F and F[c].notna().any()]
     if "real_yield" in keep:
         keep = [c for c in keep if not c.startswith("nom_")]
     return F[keep]
+
+
+# ------------------------------------------------------------------ factor compression
+def build_factors(F_src, learn_idx, thr):
+    """Merge correlated indicators into factors WITHOUT using any outcome.
+    Groups are built by average-linkage on |Spearman| measured on learn_idx only (the early part of the learn period). A group with 2+ members becomes
+    one factor = average of sign-aligned z-scores (z-score stats from learn_idx, clipped at +-4). Singletons keep their original column.
+    Returns (factor frame, META-style dict for the new factor columns, {factor column: member list})."""
+    cols = list(F_src.columns)
+    L = F_src.loc[learn_idx, cols]
+    sp = L.corr(method="spearman")
+    C = sp.abs().fillna(0).values
+    cl = [[i] for i in range(len(cols))]
+    while len(cl) > 1:
+        best, bi, bj = -1.0, -1, -1
+        for i in range(len(cl)):
+            for j in range(i + 1, len(cl)):
+                a = float(C[np.ix_(cl[i], cl[j])].mean())
+                if a > best:
+                    best, bi, bj = a, i, j
+        if best < thr:
+            break
+        cl[bi] = cl[bi] + cl[bj]
+        del cl[bj]
+    mu, sd = L.mean(), L.std().replace(0, 1).fillna(1)
+    out, meta, members = {}, {}, {}
+    for grp in sorted(cl, key=min):
+        names = [cols[i] for i in sorted(grp)]
+        if len(names) == 1:
+            out[names[0]] = F_src[names[0]]
+            continue
+        idx_ = sorted(grp)
+        sub = C[np.ix_(idx_, idx_)]
+        lead = names[int(np.argmax(sub.sum(axis=1)))]
+        z = []
+        for n in names:
+            c_ = sp.loc[n, lead]
+            sgn = 1.0 if (n == lead or not (c_ < 0)) else -1.0
+            z.append(sgn * ((F_src[n] - mu[n]) / sd[n]).clip(-4, 4))
+        key = "fac_" + "+".join(names)
+        out[key] = pd.concat(z, axis=1).mean(axis=1)
+        lt = META_ALL[lead]
+        meta[key] = (f"Factor: {lt[0]} + {len(names) - 1} related", f"{lt[1]} (factor low)", f"{lt[2]} (factor high)", False, lt[4])
+        members[key] = names
+    return pd.DataFrame(out, index=F_src.index), meta, members
 
 
 # ------------------------------------------------------------------ statistics
@@ -435,7 +633,7 @@ def build_rules(stats, cfg):
         ok = ok[ok["consistent"]]
 
     def w(t):
-        return 1.0 if wmode == "equal" else float(min(abs(t), 4.0) / 2.0)
+        return 1.0 if wmode == "equal" else float(min(max(abs(t) - 1.0, 0.0), 3.0))
 
     return ({(r.col, r.state): w(r.t) for r in ok.itertuples() if r.edge > 0},
             {(r.col, r.state): w(r.t) for r in ok.itertuples() if r.edge < 0})
@@ -505,19 +703,7 @@ def fmt_summary(d, dd=False):
 
 # ------------------------------------------------------------------ targets, splits, rules
 def cash_rate(m):
-    return (m["irx"] / 100 / 12).fillna(0) if "irx" in m else pd.Series(0.0, index=m.index)
-
-
-def target_returns(m, idx, h, kind):
-    """kind: ret = silver return, gold = silver minus gold, cash = silver minus T-bills, goldabs = gold return."""
-    if kind == "goldabs":
-        return (m["gold"].shift(-h) / m["gold"] - 1).reindex(idx)
-    s = m["silver"].shift(-h) / m["silver"] - 1
-    if kind == "gold":
-        s = s - (m["gold"].shift(-h) / m["gold"] - 1)
-    elif kind == "cash":
-        s = s - (m["irx"].fillna(0) / 100 * h / 12 if "irx" in m else 0)
-    return s.reindex(idx)
+    return ((1 + m["irx"] / 100) ** (1 / 12) - 1).fillna(0) if "irx" in m else pd.Series(0.0, index=m.index)
 
 
 def fwd_drawdown(s, h):
@@ -526,6 +712,29 @@ def fwd_drawdown(s, h):
         w = v[i: i + h + 1]
         out[i] = (w / np.maximum.accumulate(w) - 1).min()
     return pd.Series(out, index=s.index)
+
+
+def target_returns(m, idx, h, kind):
+    """kind: ret = silver return, vol = silver return scaled to a constant-volatility position (trailing vol only),
+    dd = forward max drawdown of silver plus DD_FLOOR (continuous; positive = shallower than the floor),
+    ddb = 1 if the forward max drawdown is shallower than DD_FLOOR else 0 (classification),
+    gold = silver minus gold, cash = silver minus T-bills, goldabs = gold return."""
+    if kind == "goldabs":
+        return (m["gold"].shift(-h) / m["gold"] - 1).reindex(idx)
+    if kind in ("dd", "ddb"):
+        d = fwd_drawdown(m["silver"], h)
+        out = (d + DD_FLOOR) if kind == "dd" else (d > -DD_FLOOR).astype(float).where(d.notna())
+        return out.reindex(idx)
+    s = m["silver"].shift(-h) / m["silver"] - 1
+    if kind == "vol":
+        vol = m["silver"].pct_change().rolling(12).std() * np.sqrt(12)  # known at the signal date
+        scale = (VOL_TARGET / vol).clip(0.25, 2.0).fillna(1.0)
+        s = s * scale
+    elif kind == "gold":
+        s = s - (m["gold"].shift(-h) / m["gold"] - 1)
+    elif kind == "cash":
+        s = s - (((1 + m["irx"].fillna(0) / 100) ** (h / 12) - 1) if "irx" in m else 0)
+    return s.reindex(idx)
 
 
 def split_idx(F_ok, fwd, h, frac):
@@ -584,7 +793,22 @@ def hl_spread(fwd, S, c, idx):
     return (hi.mean() - lo.mean()) * 100 if len(hi) >= 4 and len(lo) >= 4 else np.nan
 
 
-def _indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h):
+def hl_eff(fwd, S, c, idx):
+    """Risk-adjusted High minus Low spread: the same gap measured in standard deviations of the outcome."""
+    r, s = fwd.loc[idx], S.loc[idx, c]
+    hi, lo = r[s == "High"], r[s == "Low"]
+    sd = r.std()
+    return (hi.mean() - lo.mean()) / sd if len(hi) >= 4 and len(lo) >= 4 and sd > 0 else np.nan
+
+
+def hl_dd(fdd, S, c, idx):
+    """Typical forward max drawdown after High minus after Low, in points (positive = milder drawdowns after High)."""
+    d, s = fdd.reindex(idx), S.loc[idx, c]
+    hi, lo = d[s == "High"].dropna(), d[s == "Low"].dropna()
+    return (hi.median() - lo.median()) * 100 if len(hi) >= 4 and len(lo) >= 4 else np.nan
+
+
+def _indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h, fdd):
     rows = []
     for c in F_ok.columns:
         xl, yl = F_ok.loc[learn_idx, c], fwd.loc[learn_idx]
@@ -610,19 +834,21 @@ def _indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h):
         else:
             status = "🟡 Consistent but weak"
         rows.append(dict(col=c, ic_l=ic_l, ic_t=ic_t, t_l=t_l, hit=hit, hit_ci=hit_ci, same=same, minic=minic,
-                         status=status, hl_l=hl_spread(fwd, S, c, learn_idx), hl_t=hl_spread(fwd, S, c, unseen_idx)))
+                         status=status, hl_l=hl_spread(fwd, S, c, learn_idx), hl_t=hl_spread(fwd, S, c, unseen_idx),
+                         eff_l=hl_eff(fwd, S, c, learn_idx), eff_t=hl_eff(fwd, S, c, unseen_idx),
+                         dd_t=hl_dd(fdd, S, c, unseen_idx)))
     d = pd.DataFrame(rows)
     d["absl"] = d["ic_l"].abs()
     return d.sort_values(["minic", "absl"], ascending=False, na_position="last").drop(columns="absl").reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
-def _indicator_ranking_c(F_ok, fwd, S, learn_vals, unseen_vals, h):
-    return _indicator_ranking(F_ok, fwd, S, pd.DatetimeIndex(learn_vals), pd.DatetimeIndex(unseen_vals), h)
+def _indicator_ranking_c(F_ok, fwd, S, learn_vals, unseen_vals, h, fdd):
+    return _indicator_ranking(F_ok, fwd, S, pd.DatetimeIndex(learn_vals), pd.DatetimeIndex(unseen_vals), h, fdd)
 
 
-def indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h):
-    return _indicator_ranking_c(F_ok, fwd, S, pd.DatetimeIndex(learn_idx).values, pd.DatetimeIndex(unseen_idx).values, h)
+def indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h, fdd):
+    return _indicator_ranking_c(F_ok, fwd, S, pd.DatetimeIndex(learn_idx).values, pd.DatetimeIndex(unseen_idx).values, h, fdd)
 
 
 @st.cache_data(show_spinner=False)
@@ -665,12 +891,12 @@ def walk_forward(F, fwd, h, cut, step, model_name):
     """Predicts EVERY month from `cut` on (including the latest months whose outcome is not known yet).
     Training only ever uses rows whose outcome was already known at that time. No Streamlit calls in here."""
     X, yraw = F.values, fwd.values
-    known = ~np.isnan(yraw)
+    known_ = ~np.isnan(yraw)
     y = (yraw > 0).astype(int)
     out = []
     for s0 in range(cut, len(F), step):
         te = slice(s0, min(s0 + step, len(F)))
-        tr = np.where(known[: s0 - h])[0]
+        tr = np.where(known_[: s0 - h])[0]
         if len(tr) < 36:
             continue
         ytr = y[tr]
@@ -682,9 +908,13 @@ def walk_forward(F, fwd, h, cut, step, model_name):
     return pd.concat(out) if out else pd.DataFrame(columns=["p", "base"])
 
 
-def known(wf, fwd):
-    """Walk-forward rows whose outcome is already known (for scoring; the backtest can use all rows)."""
-    return wf.loc[wf.index.intersection(fwd.dropna().index)]
+def known(wf, fwd, idx=None):
+    """Walk-forward rows whose outcome is already known (for scoring; the backtest can use all rows).
+    idx restricts scoring to a period (research mode scores on validation only)."""
+    k = wf.index.intersection(fwd.dropna().index)
+    if idx is not None:
+        k = k.intersection(idx)
+    return wf.loc[k]
 
 
 @st.cache_data(show_spinner=False)
@@ -705,10 +935,10 @@ def fit_today(F, fwd, x_now, model_name):
 
 
 @st.cache_data(show_spinner=False)
-def ablation(F_ok, fwd, h, cut, step):
+def ablation(F_ok, fwd, h, cut, step, eval_vals):
     """Drop-one test with a logistic walk-forward model: how much AUC / rank IC is lost when an indicator is removed?"""
     def run(cols):
-        wk = known(walk_forward(F_ok[cols], fwd, h, cut, step, ML_MODELS[0]), fwd)
+        wk = known(walk_forward(F_ok[cols], fwd, h, cut, step, ML_MODELS[0]), fwd, pd.DatetimeIndex(eval_vals))
         if wk.empty:
             return np.nan, np.nan
         y = (fwd.loc[wk.index] > 0).astype(int)
@@ -771,8 +1001,69 @@ def scan_horizons(m, F_ok, P, target, model_name, train_frac, cfg, horizons):
 
 # ------------------------------------------------------------------ robustness
 @st.cache_data(show_spinner=False)
+def walk_forward_rules(F_ok, P, fwd, h, cut, step, cfg):
+    """Nested walk-forward: every `step` months the rules are re-estimated on months whose outcome was already known at that time,
+    then applied to the NEXT `step` months. Returns a fully out-of-sample verdict for every month from `cut` on."""
+    idx = F_ok.index
+    known_ = ~np.isnan(fwd.reindex(idx).values)
+    out = []
+    for s0 in range(cut, len(idx), step):
+        te = idx[s0: min(s0 + step, len(idx))]
+        cand = np.arange(max(s0 - h, 0))
+        learn = idx[cand[known_[cand]]]
+        if len(learn) < 36:
+            continue
+        S_ = assign_states(F_ok, learn, P)
+        g_, b_ = build_rules(bucket_stats(S_, fwd, learn, h), cfg)
+        sc = score_series(S_, g_, b_)
+        lo, hi = np.quantile(sc.loc[learn], 0.25), np.quantile(sc.loc[learn], 0.75)
+        out.append(pd.DataFrame({"v": to_verdict(sc, lo, hi).loc[te], "score": sc.loc[te]}))
+    return pd.concat(out) if out else pd.DataFrame(columns=["v", "score"])
+
+
+@st.cache_data(show_spinner=False)
+def analogue_walk_forward(F_ok, fwd, h, cut, k=ANA_K):
+    """Predictive analogue test. For every month from `cut` on, find the k closest past months among months whose outcome was ALREADY KNOWN
+    at that time (position i with i + h <= t), standardised with that database only, and report the median / share-positive outcome.
+    This is the fair, walk-forward version of the descriptive analogue table."""
+    X = F_ok.values.astype(float)
+    y = fwd.reindex(F_ok.index).values.astype(float)
+    n = len(X)
+    rows, idx = [], []
+    gap = max(h, 3)
+    for t in range(cut, n):
+        db = np.arange(0, t - h + 1)
+        db = db[~np.isnan(y[db])]
+        if len(db) < 36:
+            continue
+        mu, sd = X[db].mean(axis=0), X[db].std(axis=0, ddof=1)
+        sd[~np.isfinite(sd) | (sd == 0)] = 1.0
+        d = np.sqrt((((X[db] - mu) / sd - (X[t] - mu) / sd) ** 2).sum(axis=1))
+        chosen = []
+        for j in np.argsort(d):
+            p_ = db[j]
+            if all(abs(p_ - c) >= gap for c in chosen):
+                chosen.append(p_)
+            if len(chosen) == k:
+                break
+        a = y[chosen]
+        rows.append((float(np.median(a)), float((a > 0).mean())))
+        idx.append(F_ok.index[t])
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(idx), columns=["med", "pos"])
+
+
+def analogue_verdict(wa):
+    v = pd.Series(NEU, index=wa.index, dtype=object)
+    if wa.empty:
+        return v
+    v[(wa["med"] > 0) & (wa["pos"] >= 0.6)] = FAV
+    v[(wa["med"] <= 0) & (wa["pos"] <= 0.4)] = UNF
+    return v
+
+
+@st.cache_data(show_spinner=False)
 def sensitivity(F_ok, P, fwd, h, fracs, thrs, need_cons, wmode, test_vals):
-    """Rules learned with different learn shares and strength thresholds, ALL graded on the same final test months.
+    """Rules learned with different learn shares and strength thresholds, ALL graded on the same months.
     Cell = average outcome after Favorable minus after Unfavorable, in percentage points."""
     test_idx = pd.DatetimeIndex(test_vals)
     ev = F_ok.index.intersection(fwd.dropna().index)
@@ -824,6 +1115,7 @@ def regime_transitions(reg, fwd, ev, lookback=3):
 
 
 def analogues(F_ok, fwd, ev, x_now, h, k=10):
+    """DESCRIPTIVE analogues: the whole available history is searched. For a fair predictive test see analogue_walk_forward."""
     Fe = F_ok.loc[ev]
     mu, sd = Fe.mean(), Fe.std().replace(0, 1)
     d = np.sqrt((((Fe - mu) / sd - (x_now - mu) / sd) ** 2).sum(axis=1))
@@ -875,7 +1167,7 @@ def exposure_label(e):
 
 
 @st.cache_data(show_spinner=False)
-def analyse_target(kind, m, F_ok, P, h, train_frac, val_frac, cfg, run_ml, ml_choice, step, margin):
+def analyse_target(kind, m, F_ok, P, h, train_frac, val_frac, cfg, run_ml, ml_choice, step, margin, reveal):
     """Full rules + ML + analogues + momentum read of the CURRENT month for one target. No Streamlit calls inside."""
     fwd_ = target_returns(m, F_ok.index, h, kind)
     sp_ = split3(F_ok, fwd_, h, train_frac, val_frac)
@@ -886,12 +1178,14 @@ def analyse_target(kind, m, F_ok, P, h, train_frac, val_frac, cfg, run_ml, ml_ch
                why_good=[state_label(c, s_) for c, s_ in sorted(good_) if S_now[c] == s_],
                why_bad=[state_label(c, s_) for c, s_ in sorted(bad_) if S_now[c] == s_])
 
+    ev_u = sp_["unseen"] if reveal else sp_["val"]  # research mode never looks at the final test
+    ev_r_ = sp_["ev"] if reveal else sp_["ev"].intersection(sp_["learn"].union(sp_["val"]))
     sp, ev_level = np.nan, "Unknown"
     ev_text = "Not enough Favorable and Unfavorable months in the unseen period to judge."
     if not (good_ or bad_):
         ev_level, ev_text = "None", "No environment passed the strength filter, so the rules have no opinion."
     else:
-        ts = summarize(fwd_, verdict_, sp_["unseen"], h).set_index("Group")
+        ts = summarize(fwd_, verdict_, ev_u, h).set_index("Group")
         if ts.loc[FAV, "Months"] >= 3 and ts.loc[UNF, "Months"] >= 3:
             sp = (ts.loc[FAV, "Avg"] - ts.loc[UNF, "Avg"]) * 100
             lo_f, hi_u = ts.loc[FAV, "lo"], ts.loc[UNF, "hi"]
@@ -910,7 +1204,7 @@ def analyse_target(kind, m, F_ok, P, h, train_frac, val_frac, cfg, run_ml, ml_ch
         p_, base_, _, _ = fit_today(F_ok, fwd_, F_ok.iloc[-1], ml_choice)
         dm = p_ - base_
         auc = bss = np.nan
-        wk = known(wf_, fwd_)
+        wk = known(wf_, fwd_, ev_u)
         if not wk.empty:
             yy = (fwd_.loc[wk.index] > 0).astype(int)
             if yy.nunique() > 1:
@@ -922,28 +1216,30 @@ def analyse_target(kind, m, F_ok, P, h, train_frac, val_frac, cfg, run_ml, ml_ch
     e = float(np.mean([EXPO[v_r]] + ([EXPO[ml_info["verdict"]]] if ml_info else [])))
     res["e"] = e
     res["label"], res["icon"] = exposure_label(e)
-    a = analogues(F_ok, fwd_, sp_["ev"], F_ok.iloc[-1], h)["After"]
+    a = analogues(F_ok, fwd_, ev_r_, F_ok.iloc[-1], h)["After"]
     res["ana_med"], res["ana_pos"] = float(a.median()), float((a > 0).mean())
 
-    # confidence: do independent views agree, and did the rules work on unseen data?
+    # confidence: do the evidence channels agree, and did the rules work on unseen data?
     ser = {"ret": m["silver"], "goldabs": m["gold"], "gold": m["silver"] / m["gold"]}.get(kind, m["silver"])
     up = bool(ser.iloc[-1] > ser.rolling(10).mean().iloc[-1])
-    votes = {"Rules": SGN[v_r]}
+    comps = {"Rules": SGN[v_r]}
     if ml_info:
-        votes["ML"] = SGN[ml_info["verdict"]]
-    votes["Analogues"] = 1 if (res["ana_med"] > 0 and res["ana_pos"] >= 0.55) else (-1 if (res["ana_med"] < 0 and res["ana_pos"] <= 0.45) else 0)
-    votes["Trend"] = 1 if up else -1
+        comps["ML"] = SGN[ml_info["verdict"]]
+    comps["Analogues"] = 1 if (res["ana_med"] > 0 and res["ana_pos"] >= 0.55) else (-1 if (res["ana_med"] < 0 and res["ana_pos"] <= 0.45) else 0)
+    # Rules, ML and analogues all read the SAME indicators, so together they are ONE evidence channel, not three independent votes.
+    cs = sum(comps.values())
+    votes = {"Macro models": 1 if cs >= 2 else (-1 if cs <= -2 else 0), "Price trend": 1 if up else -1}
     npos, nneg = sum(v > 0 for v in votes.values()), sum(v < 0 for v in votes.values())
     agree, mixed = max(npos, nneg), npos == nneg
     if mixed or agree < 2:
         conf = "Low"
-    elif ev_level == "Strong" and agree >= 3:
+    elif ev_level == "Strong":
         conf = "High"
-    elif ev_level in ("Strong", "Weak"):
+    elif ev_level == "Weak":
         conf = "Medium"
     else:
         conf = "Low"
-    res.update(votes=votes, agree=agree, n_votes=len(votes), conf=conf)
+    res.update(votes=votes, comps=comps, agree=agree, n_votes=len(votes), conf=conf)
     return res
 
 
@@ -998,7 +1294,8 @@ def run_backtest_w(m, W, bps, impl="Futures"):
     rf = cash_rate(m).reindex(W.index)
     turn = W["silver"].diff().abs() + W["gold"].diff().abs()
     turn.iloc[0] = W["silver"].iloc[0] + W["gold"].iloc[0]
-    ret = _contrib(W["silver"], rs) + _contrib(W["gold"], rg) + _contrib(W["cash"], rf) - turn * bps / 1e4
+    coll = 0.0 if impl.startswith("ETF") else (W["silver"] + W["gold"]) * rf  # futures are margin-based: the invested part earns T-bills too
+    ret = _contrib(W["silver"], rs) + _contrib(W["gold"], rg) + _contrib(W["cash"], rf) + coll - turn * bps / 1e4
     return ret.dropna(), turn
 
 
@@ -1038,6 +1335,9 @@ def perf(r, rf, invested=np.nan, trades=np.nan):
 def bench_curves(m, idx, impl):
     sk, gk = px_names(impl)
     rs, rg = nxt(m[sk]).reindex(idx), nxt(m[gk]).reindex(idx)
+    if not impl.startswith("ETF"):
+        c_ = cash_rate(m).reindex(idx)
+        rs, rg = rs + c_, rg + c_
     return {"Silver buy & hold": rs.dropna(), "Gold buy & hold": rg.dropna(), "60/40 silver/gold": (0.6 * rs + 0.4 * rg).dropna(),
             "S&P 500": nxt(m["spx"]).reindex(idx).dropna(), "Cash (T-bills)": cash_rate(m).reindex(idx)}
 
@@ -1092,40 +1392,67 @@ def growth_chart(curves, common, title, mark=None):
 # ================================================================== UI
 with st.sidebar:
     st.header("Settings")
+    st.subheader("Evaluation mode")
+    eval_mode = st.radio("Mode", ["🔬 Research (final test hidden)", "🔒 Locked evaluation (reveal final test)"], label_visibility="collapsed",
+                         help="Research: experiment freely, everything is graded on VALIDATION only and the final test is hidden everywhere. "
+                              "Locked: freeze your choices, then reveal the final test. Each distinct set of settings it is shown for is counted.")
+    REVEAL = False
+    if eval_mode.startswith("🔒"):
+        REVEAL = st.checkbox("I have finished research: reveal the final test for these exact settings", False)
+    LK = REVEAL  # while the final test is revealed, every setting below is frozen
+    if LK:
+        st.caption("🔒 Settings are frozen while the final test is revealed. Untick the box above to change anything (the final test is hidden again; "
+                   "each new set of settings you reveal is counted).")
+    _key_ok = bool(get_fred_key())
+    use_vintage = st.checkbox("📅 First-release (ALFRED) data for revised series", _key_ok, disabled=LK,
+                              help="Uses first-release values and real release dates for M2, CPI, industrial production, unemployment, Philly Fed and NFCI. "
+                                   "Needs a FRED_API_KEY (on by default when one is found).")
+    if use_vintage and not _key_ok:
+        st.warning("No FRED_API_KEY found, so first-release data is off.")
+        use_vintage = False
     if st.button("🔄 Refresh data", help="Data is downloaded once and reused for 6 hours. Click to download again now."):
         get_dataset.clear()
-    start = st.text_input("Data start date", "2004-01-01")
-    target_name = st.selectbox("What to predict", list(TARGETS), help="Relative targets ask whether silver BEATS gold / cash.")
+    start = st.text_input("Data start date", "2004-01-01", disabled=LK)
+    target_name = st.selectbox("What to predict", list(TARGETS), disabled=LK,
+                               help="Raw return is dominated by a few wild years. 'Volatility-scaled forward return' scales each outcome by trailing volatility. "
+                                    "The drawdown targets predict risk instead of direction: the yes / no version is a classification, the continuous version keeps the size of the drawdown. "
+                                    "Relative targets ask whether silver BEATS gold / cash.")
     target = TARGETS[target_name]
-    auto_h = st.checkbox("🔍 Auto-find best look-ahead", False,
+    auto_h = st.checkbox("🔍 Auto-find best look-ahead", False, disabled=LK,
                          help="Tests 1-12 month look-aheads on the learning period only and prefers stable ones.")
-    h_manual = st.select_slider("Look-ahead period (months)", options=list(HORIZONS), value=6, disabled=auto_h)
+    h_manual = st.select_slider("Look-ahead period (months)", options=list(HORIZONS), value=6, disabled=auto_h or LK)
     st.subheader("Data split")
-    train_frac = st.slider("LEARN share (rules are fitted here)", 0.3, 0.6, 0.5, 0.05)
-    val_frac = st.slider("VALIDATION share (strategy choices are made here)", 0.1, 0.3, 0.2, 0.05)
+    train_frac = st.slider("LEARN share (rules are fitted here)", 0.3, 0.6, 0.5, 0.05, disabled=LK)
+    val_frac = st.slider("VALIDATION share (strategy choices are made here)", 0.1, 0.3, 0.2, 0.05, disabled=LK)
     st.caption(f"Final test = the remaining {max(0.0, 1 - train_frac - val_frac):.0%}. It only grades the locked choice.")
     st.subheader("Rules")
-    scheme = st.selectbox("How to define Low / Mid / High", ["Fixed terciles from the learn period", "Point-in-time percentile (expanding)"],
+    scheme = st.selectbox("How to define Low / Mid / High", ["Fixed terciles from the learn period", "Point-in-time percentile (expanding)"], disabled=LK,
                           help="Point-in-time ranks each month against past months only, so it adapts to drifting levels but needs ~3 more years of history.")
     pit = scheme.startswith("Point")
-    sel_mode = st.selectbox("Select environments by", ["HAC t-stat", "FDR q-value (multiple-testing adjusted)"])
-    t_thr = st.slider("Minimum strength (HAC t-stat)", 0.5, 3.0, 1.5, 0.1, disabled=sel_mode.startswith("FDR"))
-    q_thr = st.slider("Maximum FDR q-value", 0.05, 0.50, 0.20, 0.05, disabled=not sel_mode.startswith("FDR"))
-    need_consistent = st.checkbox("Require the effect in both halves of the learn period", True)
-    wlabel = st.selectbox("Indicator weighting", ["Equal (+1 / -1)", "By strength (|t|)"])
+    sel_mode = st.selectbox("Select environments by", ["HAC t-stat", "FDR q-value (multiple-testing adjusted)"], disabled=LK)
+    t_thr = st.slider("Minimum strength (HAC t-stat)", 0.5, 3.0, 1.5, 0.1, disabled=sel_mode.startswith("FDR") or LK)
+    q_thr = st.slider("Maximum FDR q-value", 0.05, 0.50, 0.20, 0.05, disabled=(not sel_mode.startswith("FDR")) or LK)
+    need_consistent = st.checkbox("Require the effect in both halves of the learn period", True, disabled=LK)
+    wlabel = st.selectbox("Indicator weighting", ["Equal (+1 / -1)", "By strength (shrunk: |t| − 1, capped)"], disabled=LK)
+    fac_mode = st.checkbox("🧬 Compress correlated indicators into factors", False, disabled=LK,
+                           help="Merges indicators that move together (measured on the early learn period only, no outcomes used) into one factor each, "
+                                "so five versions of the same story no longer count as five votes.")
+    fac_thr = st.slider("Merge when average |correlation| ≥", 0.4, 0.9, 0.6, 0.05, disabled=(not fac_mode) or LK)
     st.subheader("Machine learning")
-    run_ml = st.checkbox("Also run machine-learning models", True)
-    ml_choice = st.selectbox("Model shown in detail", ML_MODELS, disabled=not run_ml)
-    margin = st.slider("Confidence margin (points vs normal odds)", 0.02, 0.20, 0.05, 0.01, disabled=not run_ml)
-    step = st.select_slider("Retrain every (months)", options=[3, 6, 12], value=6, disabled=not run_ml)
+    run_ml = st.checkbox("Also run machine-learning models", True, disabled=LK)
+    ml_choice = st.selectbox("Model shown in detail", ML_MODELS, disabled=(not run_ml) or LK)
+    margin = st.slider("Confidence margin (points vs normal odds)", 0.02, 0.20, 0.05, 0.01, disabled=(not run_ml) or LK)
+    step = st.select_slider("Retrain every (months)", options=[3, 6, 12], value=6, disabled=(not run_ml) or LK)
     st.subheader("Backtest")
-    mode = st.selectbox("Strategy", STRATEGIES)
-    impl = st.selectbox("Implementation", ["Futures (SI=F / GC=F)", "ETFs (SLV / GLD, fees included)"])
-    bps = st.slider("Trading cost (bps per 100% traded, incl. slippage)", 0, 100, 15, 5)
-    run_perm = st.checkbox("🎲 Randomization test", True, help="Shifts the signal in time 300 times to see how often luck beats the strategy.")
-    find_best = st.checkbox("🏁 Find the best strategy", False,
+    mode = st.selectbox("Strategy", STRATEGIES, disabled=LK)
+    impl = st.selectbox("Implementation", ["ETFs (SLV / GLD; fund fees are already in the prices)", "Futures (SI=F / GC=F, T-bill collateral return added)"], disabled=LK,
+                        help="ETF is the more realistic default. SLV / GLD prices are NAV-based, so their expense ratios are already deducted. "
+                             "Yahoo futures are continuous front-month series, so roll gaps stay inside the returns.")
+    bps = st.slider("Trading cost (bps per 100% traded, incl. slippage)", 0, 100, 15, 5, disabled=LK)
+    run_perm = st.checkbox("🎲 Randomization test", True, disabled=LK, help="Shifts the signal in time 300 times to see how often luck beats the strategy.")
+    find_best = st.checkbox("🏁 Find the best strategy", False, disabled=LK,
                             help="Ranks every strategy on every signal using the VALIDATION period, then grades the winner on the untouched final test.")
-    rank_by = st.selectbox("Rank strategies by", RANK_METRICS, disabled=not find_best)
+    rank_by = st.selectbox("Rank strategies by", RANK_METRICS, disabled=(not find_best) or LK)
 
 st.title("🥈 Silver Macro Environment Analyzer")
 st.caption("Historically favorable or unfavorable macro environments for silver and gold. Not a buy/sell signal, not financial advice.")
@@ -1143,19 +1470,19 @@ if train_frac + val_frac > 0.85:
 
 try:
     cb(0.05, "Loading data (downloaded once, then reused)...")
-    m, F_full, P_full, failed, data_ts = get_dataset(get_fred_key())
+    m, F_full, P_full, failed, data_ts = get_dataset(get_fred_key(), use_vintage)
     if failed and time.time() - data_ts > 300:  # partial download: retry, but not on every click
         get_dataset.clear()
-        m, F_full, P_full, failed, data_ts = get_dataset(get_fred_key())
+        m, F_full, P_full, failed, data_ts = get_dataset(get_fred_key(), use_vintage)
 except Exception as e:
     bar.empty()
     st.error(f"Could not download market data: {e}")
     st.stop()
 
 try:
-    F_all, P_all = F_full.loc[start:], P_full.loc[start:]  # the start date only slices the cached data
+    F_all = F_full.loc[start:]  # the start date only slices the cached data
 except Exception:  # noqa: BLE001
-    F_all, P_all = F_full.iloc[0:0], P_full.iloc[0:0]
+    F_all = F_full.iloc[0:0]
 if F_all.empty:
     bar.empty()
     st.error("The start date is invalid or after the last available data. Use a format like 2004-01-01.")
@@ -1165,19 +1492,30 @@ default = [c for c in available if c in CORE or c.startswith("nom_")] or availab
 with st.sidebar:
     st.caption(f"Data through {m.index[-1]:%b %Y}, downloaded {(time.time() - data_ts) / 60:.0f} min ago. Changing settings reuses it.")
     st.subheader("Indicators")
-    chosen = st.multiselect("Indicators to use", available, default=default, format_func=lambda c: META_ALL[c][0],
-                            help="Core set is on by default. More indicators means more chances for a fluke.")
+    chosen = st.multiselect("Indicators to use", available, default=default, format_func=lambda c: META_ALL[c][0], disabled=LK,
+                            help="Core set is on by default. More indicators means more chances for a fluke. "
+                                 "Supply / demand / positioning proxies (CFTC, miners, solar) are optional because they shorten the usable history.")
 if len(chosen) < 3:
     bar.empty()
     st.error("Pick at least 3 indicators.")
     st.stop()
-META = {c: META_ALL[c] for c in chosen}
-F_ok = F_all[chosen].dropna()
+
+base_cols = list(chosen)
+F_ok = F_all[base_cols].dropna()
+F_src, fac_members = F_full[base_cols].dropna(), {}
+if fac_mode:
+    # structure is learned from the first part of the learn period only (minus the longest look-ahead), and uses no outcomes at all
+    n_l = max(int(len(F_ok) * train_frac) - max(HORIZONS), 36)
+    F_src, fmeta, fac_members = build_factors(F_src, F_ok.index[:n_l], fac_thr)
+    META_ALL.update(fmeta)
+    F_ok = F_src.loc[F_ok.index]
 P_ok = None
 if pit:
-    P_ok = P_all[chosen].reindex(F_ok.index)
+    P_src = pit_percentiles(F_src) if fac_mode else P_full[base_cols]
+    P_ok = P_src.reindex(F_ok.index)
     F_ok = F_ok.loc[P_ok.notna().all(axis=1)]
     P_ok = P_ok.loc[F_ok.index]
+META = {c: META_ALL[c] for c in F_ok.columns}
 cfg = ("q", q_thr, need_consistent, "t") if sel_mode.startswith("FDR") else ("t", t_thr, need_consistent, "t")
 cfg = (cfg[0], cfg[1], cfg[2], "equal" if wlabel.startswith("Equal") else "t")
 impl_key = "ETF" if impl.startswith("ETF") else "Futures"
@@ -1189,7 +1527,8 @@ if "real_yield" in failed:
     st.warning("FRED did not respond, so the app is using Yahoo stand-ins (10y yield, 3-month T-bill). Real rates, inflation, M2, "
                "industrial production, credit spreads, unemployment and financial conditions are missing. Reload later, or add a free FRED_API_KEY in Secrets.")
 elif failed:
-    st.info("Some FRED series were unavailable and skipped: " + ", ".join(failed))
+    st.info("Some data series were unavailable and skipped: " + ", ".join(failed)
+            + (". (cot = CFTC positioning; the rest of the app works without it.)" if "cot" in failed else ""))
 
 scan = None
 if auto_h:
@@ -1203,14 +1542,31 @@ else:
 cb(0.35, "Analysing macro environments...")
 fwd = target_returns(m, F_ok.index, h, target)
 fdd = fwd_drawdown(m["silver"], h).reindex(F_ok.index)
+if len(F_ok) < 60:
+    bar.empty()
+    st.error("Not enough history with the chosen indicators and start date. Move the start date earlier or use fewer indicators.")
+    st.stop()
 sp = split3(F_ok, fwd, h, train_frac, val_frac)
-ev, learn_idx, val_idx, test_idx, unseen_idx = sp["ev"], sp["learn"], sp["val"], sp["test"], sp["unseen"]
+ev, learn_idx, val_idx, test_idx = sp["ev"], sp["learn"], sp["val"], sp["test"]
+unseen_idx = sp["unseen"] if REVEAL else val_idx  # research mode never grades on the final test
+ev_r = ev if REVEAL else ev.intersection(learn_idx.union(val_idx))
+grade_idx = test_idx if REVEAL else val_idx
+grade_name = "Final test" if REVEAL else "Validation"
+unseen_lbl = "validation + final test" if REVEAL else "validation"
 if len(learn_idx) < 36 or len(val_idx) < 8 or len(test_idx) < 12:
     bar.empty()
     st.error("Not enough history for a learn / validation / test split. Move the start date earlier, shrink the learn or validation share, or use fewer indicators.")
     st.stop()
 
+peek = None
+if REVEAL:
+    peek = register_peek(repr((start, target, h, auto_h, sorted(base_cols), fac_mode, fac_thr, use_vintage, train_frac, val_frac, pit, cfg,
+                               run_ml, ml_choice, margin, step, mode, impl_key, bps, find_best, rank_by)))
+
 S, stats, good, bad, score, verdict = run_rules(F_ok, P_ok, fwd, learn_idx, h, cfg)
+wfr = walk_forward_rules(F_ok, P_ok, fwd, h, sp["cut"], RULE_STEP, cfg)
+wa = analogue_walk_forward(F_ok, fwd, h, sp["cut"])
+ana_ver = analogue_verdict(wa)
 
 ml = {}
 if run_ml:
@@ -1219,15 +1575,15 @@ if run_ml:
         ml[name] = walk_forward(F_ok, fwd, h, sp["cut"], step, name)
     ml_p, ml_base, ml_imp, ml_contrib = fit_today(F_ok, fwd, F_ok.iloc[-1], ml_choice)
 cb(0.7, "Reading silver, gold and silver vs gold...")
-NOW = {k: analyse_target(k, m, F_ok, P_ok, h, train_frac, val_frac, cfg, run_ml, ml_choice, step, margin) for k in NOW_KINDS}
+NOW = {k: analyse_target(k, m, F_ok, P_ok, h, train_frac, val_frac, cfg, run_ml, ml_choice, step, margin, REVEAL) for k in NOW_KINDS}
 cb(1.0, "Done")
 bar.empty()
 
 now = F_ok.index[-1]
 v_now, sc_now = verdict.loc[now], float(score.loc[now])
-ana = analogues(F_ok, fwd, ev, F_ok.iloc[-1], h)
+ana = analogues(F_ok, fwd, ev_r, F_ok.iloc[-1], h)
 reg = classify_regime(F_all.reindex(F_ok.index), F_ok.index, learn_idx)
-streak = streak_info(verdict, fwd, ev)
+streak = streak_info(verdict, fwd, ev_r)
 expo_list = [EXPO[v_now]]
 if run_ml:
     dm = ml_p - ml_base
@@ -1235,11 +1591,26 @@ if run_ml:
     expo_list.append(EXPO[ml_v_now])
 expo_now = float(np.mean(expo_list))
 ICON = {FAV: "🟢", NEU: "⚪", UNF: "🔴"}
-tgt_txt = {"ret": "silver is higher", "gold": "silver beats gold", "cash": "silver beats cash"}[target]
+tgt_txt = TGT_TXT[target]
+tgt_note = {"vol": f" Outcomes are silver's forward return times a position-size multiplier ({VOL_TARGET:.0%} target / trailing volatility, known at the signal date), so calm and wild periods count more equally. It is not a realised vol-targeted portfolio.",
+            "dd": f" Outcome shown = worst drawdown over the look-ahead plus {DD_FLOOR:.0%} points, so positive means the drawdown stayed shallower than {DD_FLOOR:.0%}. "
+                  "Favorable = historically calm / shallow-drawdown environment.",
+            "ddb": f" Outcome = 1 if silver's worst drawdown over the look-ahead stayed shallower than {DD_FLOOR:.0%}, else 0, so 'Avg after' is the share of cases that avoided it. "
+                   "Favorable = historically calm / shallow-drawdown environment."}.get(target, "")
 
 st.info(f"Predicting: **{target_name}** over **{h} months**" + (" (auto-selected on the learning period only, then locked)" if auto_h else "")
-        + f"  |  Indicators: **{len(META)}**  |  Learn {learn_idx[0]:%b %Y}–{learn_idx[-1]:%b %Y}, validation {val_idx[0]:%b %Y}–{val_idx[-1]:%b %Y}, "
-        f"final test {test_idx[0]:%b %Y}–{test_idx[-1]:%b %Y}")
+        + f"  |  {'Factors / indicators' if fac_mode else 'Indicators'}: **{len(META)}**  |  Learn {learn_idx[0]:%b %Y}–{learn_idx[-1]:%b %Y}, validation {val_idx[0]:%b %Y}–{val_idx[-1]:%b %Y}, "
+        + (f"final test {test_idx[0]:%b %Y}–{test_idx[-1]:%b %Y}" if REVEAL else "final test hidden (research mode)") + tgt_note)
+
+if REVEAL:
+    n_pk, new_pk = peek
+    (st.success if n_pk == 1 else st.warning)(
+        "🔒 Final test revealed. " + ("This is the first set of settings it has ever been shown for, so it is a clean grade." if n_pk == 1 else
+        f"It has now been shown under {n_pk} different sets of settings ({'this one is new' if new_pk else 'this one was already counted'}). "
+        "Only the first reveal is a clean test; every extra look turns it into a selection tool, so treat results as optimistic."))
+else:
+    st.info("🔬 Research mode: the final test period is hidden everywhere and all grading uses the validation period. "
+            "Switch to Locked evaluation in the sidebar once your settings are frozen.")
 
 tabs_def = [("dash", "📊 Dashboard"), ("guide", "📖 Guide"), ("env", "🗺 Environments"), ("rank", "🏆 Indicator ranking"),
             ("test", "🧪 Out-of-sample"), ("reg", "🧭 Regimes & analogues"), ("bt", "💰 Backtest"), ("rob", "🛡 Robustness"),
@@ -1265,8 +1636,9 @@ with T["dash"]:
 
     r_ = NOW["ret"]
     st.markdown(f"**Silver overall:** {r_['icon']} {r_['label']} | **Confidence: {r_['conf']}** "
-                f"({r_['agree']} of {r_['n_votes']} views agree; evidence on unseen data: {r_['ev_level']}). "
-                + " · ".join(f"{k} {VICON[v]}" for k, v in r_["votes"].items()))
+                f"({r_['agree']} of {r_['n_votes']} evidence channels agree; evidence on unseen data: {r_['ev_level']}). "
+                + " · ".join(f"{k} {VICON[v]}" for k, v in r_["votes"].items())
+                + "  (macro models = " + ", ".join(f"{k} {VICON[v]}" for k, v in r_["comps"].items()) + ", all reading the same indicators)")
     st.caption("Exposure = average of the rules and ML views (Favorable 100%, Neutral 50%, Unfavorable 0%) as a share of the silver allocation you already intended. "
                "The last tab compares silver, gold and silver-vs-gold side by side.")
 
@@ -1298,7 +1670,8 @@ with T["dash"]:
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Median", pc(a.median())); k2.metric("Average", pc(a.mean())); k3.metric("Positive", f"{(a > 0).mean():.0%}")
         k4.metric("Worst", pc(a.min())); k5.metric("Best", pc(a.max()))
-        st.caption("Only 10 observations: indicative, not statistical proof.")
+        st.caption("Only 10 observations: indicative, not statistical proof. Descriptive: the search uses all history available" + ("" if REVEAL else " (final test excluded in research mode)")
+                   + ". The Regimes & analogues tab has a fair, expanding-database version of this test.")
 
     with st.expander("What would change the rules' verdict?"):
         th = state_thresholds(F_ok, learn_idx, pit)
@@ -1314,7 +1687,8 @@ with T["dash"]:
                              "Current value": fmt_val(c, F_ok.loc[now, c]), "Stops counting if it": flips})
         if rows:
             show_df(st, pd.DataFrame(rows))
-            st.caption("Thresholds are the Low/High cut-offs used by the rules" + (" (approximated by the full history to date in point-in-time mode)." if pit else " (learn-period terciles)."))
+            st.caption("Thresholds are the Low/High cut-offs used by the rules" + (" (approximated by the full history to date in point-in-time mode)." if pit else " (learn-period terciles).")
+                       + (" Factor values are in z-score units." if fac_mode else ""))
         else:
             st.write("No active rule is currently contributing to the verdict.")
 
@@ -1326,22 +1700,45 @@ with T["guide"]:
     st.markdown(f"""
 ### How this works
 - **Three periods.** History is split into LEARN ({learn_idx[0]:%b %Y}–{learn_idx[-1]:%b %Y}), VALIDATION ({val_idx[0]:%b %Y}–{val_idx[-1]:%b %Y}) and FINAL TEST ({test_idx[0]:%b %Y}–{test_idx[-1]:%b %Y}).
-  Rules are fitted on LEARN. Every choice (which strategy, which signal) is made on VALIDATION. The FINAL TEST only grades the locked choice. Outcome windows are purged so periods never overlap.
-- **Environments (rules):** each month is described by {len(META)} macro indicators, each split into Low/Neutral/High (fixed terciles from the learn period, or point-in-time percentiles).
+  The selection hierarchy is explicit: indicators, factors, rules and the look-ahead are chosen on LEARN only; strategy and signal are chosen on VALIDATION; the FINAL TEST only grades the locked choice.
+  Outcome windows are purged so periods never overlap.
+- **What is predicted.** Raw silver return, a **volatility-scaled forward return** (each outcome scaled by trailing volatility, so crisis years do not dominate), a **drawdown** target in two forms
+  (yes / no: the worst fall over the look-ahead stays under {DD_FLOOR:.0%}; or the continuous drawdown, which keeps the size of the fall), or silver relative to gold / cash.
+  Macro and stress variables often predict risk better than direction, so try the drawdown targets.
+- **Environments (rules):** each month is described by {len(META)} {'factors / indicators' if fac_mode else 'macro indicators'}, each split into Low/Neutral/High (fixed terciles from the learn period, or point-in-time percentiles).
   We measure the {h}-month outcome in each bucket and keep environments that are statistically clear (HAC t-stat, or FDR q-value to account for testing dozens of buckets) and hold in both halves of the learn period.
-- **Indicator ranking:** correlation with the outcome on learn and unseen data, plus a drop-one test (does the indicator add predictive value to a logistic model?).
+- **Factor compression (optional).** FDR handles many tests but not correlated predictors. With factor mode on, indicators that move together (average-linkage |Spearman| ≥ the chosen threshold, measured on the early learn period only,
+  no outcomes involved) become one factor: the average of their sign-aligned z-scores. Indicators with no close relatives stay as they are. See the Robustness tab for the composition.
+- **Indicator ranking:** correlation with the outcome on learn and unseen data, a drop-one test, plus two risk-aware descriptive columns: the High-minus-Low gap in standard deviations of the outcome,
+  and the typical drawdown after High versus Low states.
 - **Machine learning:** three models estimate the chance that *{tgt_txt}*, retrained walk-forward on data whose outcomes were known at the time. AUC comes with a bootstrap confidence interval.
-- **Backtest:** ten strategies on futures or ETFs with trading costs. Besides benchmarks it compares against a **no-timing mix with the same average exposure**,
+- **Analogues:** the 10-closest-months table is descriptive (it searches all history). The predictive test searches, for every unseen month, only months whose outcome was already known then, and is scored on unseen months.
+- **Backtest:** ten strategies on ETFs (default) or futures with trading costs. Besides benchmarks it compares against a **no-timing mix with the same average exposure**,
   and runs a **randomization test** (signal shifted in time) so you can see how often luck would have done as well.
-- **Robustness:** multiple-testing summary, parameter-sensitivity grid, rolling indicator strength, indicator redundancy.
-- **Silver & gold now:** separate reads for silver, gold and silver-versus-gold, with a confidence level that combines how many independent views agree and whether the rules worked on unseen data.
+- **Robustness:** multiple-testing summary, parameter-sensitivity grid, rolling indicator strength, indicator redundancy, factor composition.
+- **Silver & gold now:** separate reads for silver, gold and silver-versus-gold, with a confidence level that combines how many evidence channels agree and whether the rules worked on unseen data.
+
+### Supply, demand and positioning (optional pillar)
+- There is **no free, point-in-time dataset of physical silver supply and demand** (mine output, recycling, industrial use, inventories). The Silver Institute and USGS balances are annual, published months late and revised.
+- The app therefore offers proxies, switched off by default: **CFTC managed-money net position** in COMEX silver (% of open interest, weekly),
+  **silver miners (SIL) versus silver**, and **solar stocks (TAN)** as an industrial-demand proxy. SIL starts in 2010 and TAN in 2008, so enabling them shortens the usable history and the three-way split.
+- The CFTC API gives only the Tuesday as-of date. The release date is computed as the Friday of that week, pushed one business day later around US federal holidays and rolled past weekends (conservative: never earlier than the real release).
+
+### Evaluation discipline
+- **Research vs Locked.** In Research mode the final test is hidden everywhere and every grade uses validation only. In Locked mode you reveal it and **every setting is frozen**; the app counts how many different sets of settings the final test has been shown for.
+  The counter is stored in `.final_test_peeks.json` next to the app (on hosts with an ephemeral disk it falls back to the session).
+- **Expanding-window rules.** Rules are refitted every {RULE_STEP} months on outcomes already known, then applied to the next {RULE_STEP} months. This gives a verdict for every unseen month that never saw its own future.
+- **Evidence channels.** Rules, ML and analogues share the same indicators, so they count as one macro channel. Price trend is the second. Confidence is High only if both agree and the rules worked on unseen data.
+- **First-release data (optional, needs a FRED key, on by default when a key exists).** M2, CPI, industrial production, unemployment, the Philly Fed survey and NFCI use first-release values and release dates.
+  Observations older than FRED's first archived vintage carry that earliest archived value, so very early history is only partly point-in-time.
+- Still not done: nested hyperparameter selection inside every walk-forward fold, and contract-level futures rolls.
 
 ### Known limits (read these)
-- **Publication lags are approximations** (see PUB_LAG in the code). Monthly series such as M2, industrial production and unemployment are later **revised**; this app uses today's revised values.
-  A stricter test needs ALFRED vintage data.
-- **Futures are continuous front-month contracts** from Yahoo, so roll gaps are inside the returns. The ETF option (SLV / GLD) avoids that and includes fees, but starts in 2006 / 2004.
+- **Publication lags are approximations** (see PUB_LAG in the code) wherever first-release data is switched off or unavailable.
+- **Futures are continuous front-month contracts** from Yahoo, so roll gaps are inside the returns and the futures backtest is not a real roll simulation. The ETF option (SLV / GLD) avoids that.
+  ETF prices are NAV-based and already net of the expense ratio, so no extra fee is deducted (that would double count). The ETF option starts in 2006 (SLV) / 2004 (GLD).
 - **Credit spread** is Moody's Baa minus 10y (full history on FRED). ICE BofA high-yield spreads are limited to recent years on FRED, and the ISM PMI is no longer on FRED, so the Philly Fed factory survey stands in.
-- **Selection bias remains** whenever you click through many settings. Judge settings by the final-test and randomization results, not by the one that looks best.
+- **Selection bias remains** whenever you click through many settings (and several targets). Judge settings by the final-test and randomization results, not by the one that looks best.
 - Educational only, not financial advice.
 """)
 
@@ -1389,9 +1786,9 @@ with T["rank"]:
     st.subheader("Which indicators predict best?")
     st.caption(f"Target: **{target_name}** over **{h} months**. Each indicator is compared with the outcome that followed, "
                f"first on the learning period ({learn_idx[0]:%b %Y} to {learn_idx[-1]:%b %Y}), then on data it has never seen "
-               f"({unseen_idx[0]:%b %Y} to {unseen_idx[-1]:%b %Y}, validation + final test). Ranking is by the smaller of the two correlations, and 0 if the direction flips.")
-    rk = indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h)
-    ab = ablation(F_ok, fwd, h, sp["cut"], step).set_index("col")
+               f"({unseen_idx[0]:%b %Y} to {unseen_idx[-1]:%b %Y}, {unseen_lbl}). Ranking is by the smaller of the two correlations, and 0 if the direction flips.")
+    rk = indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h, fdd)
+    ab = ablation(F_ok, fwd, h, sp["cut"], step, unseen_idx.values).set_index("col")
     top = rk[rk["minic"] > 0].head(3)
     if len(top):
         st.success("Most consistent so far: " + ", ".join(f"**{META[r.col][0]}** ({r.minic:.0f}%)" for r in top.itertuples()))
@@ -1411,13 +1808,18 @@ with T["rank"]:
         "Hit rate (unseen) ±95%": ["-" if pd.isna(a) else f"{a:.0%} ± {b * 100:.0f}" for a, b in zip(rk["hit"], rk["hit_ci"])],
         "High − Low (learn)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_l"]],
         "High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_t"]],
+        "High − Low in σ (learn)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_l"]],
+        "High − Low in σ (unseen)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_t"]],
+        "Drawdown after High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.0f} pts" for v in rk["dd_t"]],
         "ΔAUC if removed": [("-" if pd.isna(ab["dauc"].get(c, np.nan)) else f"{ab['dauc'][c]:+.3f}") for c in rk["col"]],
         "Verdict": rk["status"]}))
     st.caption("**Corr** = rank correlation with the outcome (±10% is already useful for macro data, below ±5% is hard to tell from noise). "
                "**Min |corr|** = the smaller of the learn and unseen correlations (0% if the sign flips). It is a consistency score, not a statistical test. "
                "**Hit rate** = how often the learn-period direction called the above/below-median outcome on unseen data (50% = coin flip), with a 95% range that allows for overlapping windows. "
+               "**High − Low in σ** = the same High-minus-Low gap measured in standard deviations of the outcome (a risk-adjusted effect size; about 0.3σ or more is notable). "
+               "**Drawdown after High − Low** = typical worst fall over the look-ahead after High states minus after Low states (positive = milder drawdowns when the indicator is High). "
                "**ΔAUC if removed** = how much a logistic walk-forward model loses without this indicator (positive = it adds information; differences under about 0.02 are noise). "
-               "With this many indicators tested, a few look good by luck.")
+               "The σ and drawdown columns are descriptive and are not used to pick rules. With this many indicators tested, a few look good by luck.")
 
     d_ = rk.dropna(subset=["ic_l"])
     if len(d_):
@@ -1458,32 +1860,60 @@ with T["test"]:
         b.subheader("Validation period (unseen by the rules)")
         b.caption(f"{val_idx[0]:%b %Y} to {val_idx[-1]:%b %Y}. Choices such as strategy and signal are made here.")
         show_df(b, fmt_summary(summarize(fwd, verdict, val_idx, h, fdd), True))
-        st.subheader("Final test ✅ (never used for any choice)")
-        st.caption(f"{test_idx[0]:%b %Y} to {test_idx[-1]:%b %Y}.")
-        tsum = summarize(fwd, verdict, test_idx, h, fdd)
-        show_df(st, fmt_summary(tsum, True))
-        bf = go.Figure(go.Bar(x=tsum["Group"], y=tsum["Avg"] * 100, marker_color=["#2e9e5b", "#9aa0a6", "#d64545", "#4a6fa5"],
-                              error_y=dict(type="data", symmetric=False, array=(tsum["hi"] - tsum["Avg"]) * 100,
-                                           arrayminus=(tsum["Avg"] - tsum["lo"]) * 100),
-                              text=[f"{v:+.1f}%" if pd.notna(v) else "" for v in tsum["Avg"] * 100], textposition="outside"))
-        bf.update_layout(title="Final test: average outcome with 95% block-bootstrap CI", yaxis_title="%", height=380)
-        show_plot(st, bf)
-        tb = tsum.set_index("Group")
+        tb = None
+        if REVEAL:
+            st.subheader("Final test ✅ (never used for any choice, if this is your first reveal)")
+            st.caption(f"{test_idx[0]:%b %Y} to {test_idx[-1]:%b %Y}.")
+            tsum = summarize(fwd, verdict, test_idx, h, fdd)
+            show_df(st, fmt_summary(tsum, True))
+            bf = go.Figure(go.Bar(x=tsum["Group"], y=tsum["Avg"] * 100, marker_color=["#2e9e5b", "#9aa0a6", "#d64545", "#4a6fa5"],
+                                  error_y=dict(type="data", symmetric=False, array=(tsum["hi"] - tsum["Avg"]) * 100,
+                                               arrayminus=(tsum["Avg"] - tsum["lo"]) * 100),
+                                  text=[f"{v:+.1f}%" if pd.notna(v) else "" for v in tsum["Avg"] * 100], textposition="outside"))
+            bf.update_layout(title="Final test: average outcome with 95% block-bootstrap CI", yaxis_title="%", height=380)
+            show_plot(st, bf)
+            tb = tsum.set_index("Group")
+        else:
+            st.subheader("Final test 🔒 hidden")
+            st.caption("Research mode keeps the final test out of every table and chart. Use the validation results above while you experiment, then switch to Locked evaluation.")
+            tb = summarize(fwd, verdict, val_idx, h, fdd).set_index("Group")
         if tb.loc[FAV, "Months"] > 0 and tb.loc[UNF, "Months"] > 0:
             sp_ = (tb.loc[FAV, "Avg"] - tb.loc[UNF, "Avg"]) * 100
             overlap = tb.loc[FAV, "lo"] <= tb.loc[UNF, "hi"]
             (st.success if sp_ > 2 and not overlap else st.warning)(
-                f"Favorable minus Unfavorable: {sp_:.1f} points. " + ("The confidence intervals do not overlap, which is encouraging."
-                                                                    if not overlap else "The confidence intervals overlap, so this could easily be noise."))
+                f"{grade_name}: Favorable minus Unfavorable = {sp_:.1f} points. " + ("The confidence intervals do not overlap, which is encouraging."
+                                                                                   if not overlap else "The confidence intervals overlap, so this could easily be noise."))
+        m_show = m if REVEAL else m.loc[: val_idx[-1]]
         pl = go.Figure()
-        pl.add_scatter(x=m.index, y=m["silver"], name="Silver", line=dict(color="#888"))
+        pl.add_scatter(x=m_show.index, y=m_show["silver"], name="Silver", line=dict(color="#888"))
         for g_, col in [(FAV, "#2e9e5b"), (UNF, "#d64545")]:
             ix = verdict[verdict == g_].index
-            pl.add_scatter(x=ix, y=m["silver"].reindex(ix), mode="markers", name=g_, marker=dict(color=col, size=6))
+            ix = ix[ix <= m_show.index[-1]]
+            pl.add_scatter(x=ix, y=m_show["silver"].reindex(ix), mode="markers", name=g_, marker=dict(color=col, size=6))
         vmark(pl, val_idx[0], "validation starts")
-        vmark(pl, test_idx[0], "final test starts")
+        if REVEAL:
+            vmark(pl, test_idx[0], "final test starts")
         pl.update_layout(title="Silver with macro verdicts", yaxis_type="log", height=380)
         show_plot(st, pl)
+
+    st.subheader(f"Expanding-window rules (refitted every {RULE_STEP} months, fully out-of-sample)")
+    st.caption(f"Every {RULE_STEP} months the rules are re-estimated on all months whose outcome was already known at that time, then applied to the next {RULE_STEP} months. "
+               f"Unlike the single fit above, this gives a verdict for every {unseen_lbl} month that never saw its own future, and shows whether the rule set stays useful as history accumulates.")
+    if wfr.empty:
+        st.info("Not enough history to refit the rules walk-forward.")
+    else:
+        ev_w = unseen_idx.intersection(wfr.index)
+        sw = summarize(fwd, wfr["v"], ev_w, h, fdd)
+        show_df(st, fmt_summary(sw, True))
+        tw = sw.set_index("Group")
+        if tw.loc[FAV, "Months"] >= 3 and tw.loc[UNF, "Months"] >= 3:
+            spw = (tw.loc[FAV, "Avg"] - tw.loc[UNF, "Avg"]) * 100
+            ovw = tw.loc[FAV, "lo"] <= tw.loc[UNF, "hi"]
+            (st.success if spw > 2 and not ovw else st.warning)(
+                f"Expanding-window rules, {unseen_lbl}: Favorable minus Unfavorable = {spw:.1f} points. "
+                + ("Intervals do not overlap." if not ovw else "Intervals overlap, so this could be noise."))
+        else:
+            st.caption("Too few Favorable or Unfavorable months to compare.")
 
 # ------------------------------------------------------------------ regimes & analogues
 with T["reg"]:
@@ -1493,10 +1923,10 @@ with T["reg"]:
         st.subheader("Growth × inflation regimes")
         st.caption("Growth = average z-score of copper, industrial production, Philly Fed survey and (inverted) Sahm gauge; inflation = CPI, breakevens and oil "
                    "(z-scores from the learn period). Stocks are not used: they measure risk appetite, not growth. Descriptive over all months with known outcomes.")
-        rs = summarize(fwd, reg, ev, h, fdd, order=REGIMES)
+        rs = summarize(fwd, reg, ev_r, h, fdd, order=REGIMES)
         show_df(st, fmt_summary(rs, True))
         st.markdown(f"**Today:** {reg.iloc[-1]}")
-        tr_df, tr_cur, _ = regime_transitions(reg, fwd, ev)
+        tr_df, tr_cur, _ = regime_transitions(reg, fwd, ev_r)
         st.markdown("**Regime transitions** (regime 3 months ago → regime now, only months where it changed; overlapping windows, so treat n as optimistic)")
         if tr_cur:
             st.markdown(f"Current transition: **{tr_cur}**")
@@ -1507,11 +1937,12 @@ with T["reg"]:
         else:
             show_df(st, pd.DataFrame({"Transition": tr_df["Transition"], "Months": tr_df["Months"], f"Avg after {h}m": tr_df["Avg"].map(pc),
                                       "Median": tr_df["Median"].map(pc), "% positive": tr_df["Win"].map(lambda v: pc(v, False))}))
-    st.subheader("10 most similar historical environments")
-    st.caption("Closest months by standardized distance across all selected indicators (at least h months apart). Closeness is relative to the typical distance in history.")
+    st.subheader("10 most similar historical environments (descriptive)")
+    st.caption("Closest months by standardized distance across all selected indicators (at least h months apart). Closeness is relative to the typical distance in history. "
+               "This searches the whole available history, so it describes the past; it is NOT a backtest of the method (see the predictive test below).")
     show_df(st, pd.DataFrame({"Date": ana["Date"], "Closeness": ana["Closeness"].map(lambda v: f"{v:.0f}%"),
                               f"Outcome after {h}m": ana["After"].map(pc)}))
-    ser_path = {"ret": m["silver"], "cash": m["silver"], "gold": m["silver"] / m["gold"]}[target]
+    ser_path = (m["silver"] / m["gold"]) if target == "gold" else m["silver"]
     paths = analogue_paths(ser_path, ana["dt"], h)
     if not paths.empty:
         pf_ = go.Figure()
@@ -1522,14 +1953,42 @@ with T["reg"]:
                           xaxis_title="Months after", yaxis_title="%", height=400)
         show_plot(st, pf_)
 
+    st.subheader("Predictive test of the analogue method (expanding database)")
+    st.caption(f"For every {unseen_lbl} month the method looks for the {ANA_K} closest past months among months whose outcome was already known at that time "
+               f"(standardised with that database only). Favorable = median outcome of the analogues is positive and at least 60% were positive; "
+               f"Unfavorable = median not positive and at most 40% positive. This is the fair version of the table above.")
+    if wa.empty:
+        st.info("Not enough history for the predictive analogue test.")
+    else:
+        ev_a = unseen_idx.intersection(wa.index)
+        sa = summarize(fwd, ana_ver, ev_a, h, fdd)
+        show_df(st, fmt_summary(sa, True))
+        ta = sa.set_index("Group")
+        ic_a = rank_ic(wa["med"].reindex(ev_a), fwd.reindex(ev_a))
+        if ta.loc[FAV, "Months"] >= 3 and ta.loc[UNF, "Months"] >= 3:
+            spa = (ta.loc[FAV, "Avg"] - ta.loc[UNF, "Avg"]) * 100
+            ova = ta.loc[FAV, "lo"] <= ta.loc[UNF, "hi"]
+            (st.success if spa > 2 and not ova else st.warning)(
+                f"Predictive analogues, {unseen_lbl}: Favorable minus Unfavorable = {spa:.1f} points; rank IC of the analogue median = {ic_a:+.2f}. "
+                + ("Intervals do not overlap." if not ova else "Intervals overlap, so this could be noise."))
+        else:
+            st.caption(f"Too few Favorable or Unfavorable analogue calls to compare (rank IC of the analogue median: {pc(ic_a)}).")
+
 # ------------------------------------------------------------------ backtest
 with T["bt"]:
     st.subheader("What if you had followed the signals?")
     rf_all = cash_rate(m)
     sk, gk = px_names(impl_key)
+    if impl_key == "Futures":
+        st.warning("Futures mode uses Yahoo's continuous front-month series, so roll gaps and roll yield are baked into the returns and the result is not a real roll simulation. "
+                   "Treat it as a rough check; the ETF implementation is the more defensible one.")
 
-    # signal sources (full history of verdicts; the backtest slices them to validation + final test)
+    # signal sources (full history of verdicts; the backtest slices them to validation (+ final test in locked mode))
     src = {"Rules": verdict}
+    if not wfr.empty:
+        src["Rules (expanding refit)"] = wfr["v"]
+    if not ana_ver.empty:
+        src["Analogues (expanding)"] = ana_ver
     if run_ml and not ml[ml_choice].empty:
         mv = ml_verdict(ml[ml_choice], margin)
         src[f"ML ({ml_choice})"] = mv
@@ -1544,20 +2003,30 @@ with T["bt"]:
         bt_all = v_.index if bt_all is None else bt_all.intersection(v_.index)
     okn = (nxt(m[sk]).notna() & nxt(m[gk]).notna()).reindex(bt_all).fillna(False).values.astype(bool)
     bt_all = bt_all[(bt_all >= val_idx[0]) & okn]
+    if not REVEAL:
+        bt_all = bt_all[bt_all < test_idx[0]]  # research mode: the final test period is not even simulated
     val_bt, test_bt = bt_all[bt_all < test_idx[0]], bt_all[bt_all >= test_idx[0]]
     src = {k: v_.loc[bt_all] for k, v_ in src.items()}
     px_s = m["silver"]
     aux = pd.DataFrame({"trend": (px_s > px_s.rolling(10).mean()), "vol": px_s.pct_change().rolling(12).std() * np.sqrt(12)}).reindex(bt_all)
     aux["trend"] = aux["trend"].fillna(False).astype(bool)
+    grade_bt = test_bt if REVEAL else val_bt
 
-    if len(val_bt) < 12 or len(test_bt) < 12:
+    if len(val_bt) < 12 or (REVEAL and len(test_bt) < 12):
         st.warning("The validation or final-test period is too short for a backtest. Move the start date earlier or lower the learn / validation share.")
     else:
-        per = st.radio("Period shown", ["Final test (untouched)", "Validation (used for choices)", "Both"], horizontal=True)
-        idx_show = {"Final": test_bt, "Valid": val_bt}.get(per.split()[0], bt_all)
-        st.caption(f"Strategy shown: **{mode}**. Signal at each month-end sets the position for the next month. Idle money earns the T-bill rate. "
-                   f"Cost: {bps} bps per 100% traded (switching silver to gold trades both). Implementation: **{impl_key}**. "
-                   f"Validation {val_bt[0]:%b %Y}–{val_bt[-1]:%b %Y} ({len(val_bt)} months), final test {test_bt[0]:%b %Y}–{test_bt[-1]:%b %Y} ({len(test_bt)} months).")
+        if target in RISK_TARGETS:
+            st.caption("Note: the signal here was learned for a risk-aware target, so Favorable means 'calmer / better risk-adjusted', not necessarily 'higher return'. "
+                       "The backtest still reports ordinary returns.")
+        opts = ["Final test (untouched)", "Validation (used for choices)", "Both"] if REVEAL else ["Validation (used for choices)"]
+        per = st.radio("Period shown", opts, horizontal=True)
+        idx_show = test_bt if per.startswith("Final") else (val_bt if per.startswith("Valid") else bt_all)
+        st.caption(f"Strategy shown: **{mode}**. Signal at each month-end sets the position for the next month. Idle money earns the T-bill rate"
+                   + (" (and so does the invested part of a futures position, as margin collateral)" if impl_key == "Futures" else "") + ". "
+                   f"Cost: {bps} bps per 100% traded (switching silver to gold trades both). Implementation: **{impl_key}**"
+                   + (" (SLV / GLD prices already include the funds' expense ratios)" if impl_key == "ETF" else "") + ". "
+                   f"Validation {val_bt[0]:%b %Y}–{val_bt[-1]:%b %Y} ({len(val_bt)} months)"
+                   + (f", final test {test_bt[0]:%b %Y}–{test_bt[-1]:%b %Y} ({len(test_bt)} months)." if REVEAL else ". Final test hidden (research mode)."))
         curves, rows, full = {}, [], {}
         pairs = [("Trend only (no macro signal)", next(iter(src.values())))] if mode in NO_SIGNAL else list(src.items())
         for sname, v_ in pairs:
@@ -1577,30 +2046,31 @@ with T["bt"]:
             curves[bname] = bret
             is_cash = bname.startswith("Cash")
             rows.append((bname, perf(bret, rf_all, 0.0 if is_cash else 1.0, 0 if is_cash else 1)))
-        show_plot(st, growth_chart(curves, idx_show, "Growth of 1 unit", mark=test_bt[0] if per == "Both" else None))
+        show_plot(st, growth_chart(curves, idx_show, "Growth of 1 unit", mark=test_bt[0] if (REVEAL and per == "Both") else None))
         show_df(st, perf_table(rows))
         st.caption("The no-timing mix holds the same average silver / gold / cash split as the strategy, every month. If the strategy cannot beat it, the signal added nothing: "
                    "the result came from being less invested, not from timing. A short test period and a handful of trades make all numbers noisy.")
 
         pm = rank_by if find_best else "Sharpe"
         if run_perm:
-            st.markdown(f"**Randomization test on the final test ({pm})** — how often does the same strategy run on a randomly time-shifted signal do as well?")
+            st.markdown(f"**Randomization test on the {grade_name.lower()} ({pm})** — how often does the same strategy run on a randomly time-shifted signal do as well?")
             prow = []
             for sname, v_ in pairs:
                 ret, turn, W = full[sname]
-                obs = perf(seg(ret, turn, W, test_bt)[0], rf_all)[pm]
-                p_, med_, p95_ = perm_p(shift_null(m, v_, aux, mode, bps, impl_key, test_bt.values, pm), obs)
+                obs = perf(seg(ret, turn, W, grade_bt)[0], rf_all)[pm]
+                p_, med_, p95_ = perm_p(shift_null(m, v_, aux, mode, bps, impl_key, grade_bt.values, pm), obs)
                 prow.append({"Signal": sname, f"Observed {pm}": fm(pm, obs), "Random median": fm(pm, med_), "Random 95th pct": fm(pm, p95_),
                              "p-value": "-" if pd.isna(p_) else f"{p_:.2f}", "Verdict": "✅ beats luck" if (pd.notna(p_) and p_ <= 0.10) else "❌ not distinguishable from luck"})
             show_df(st, pd.DataFrame(prow))
             st.caption("p-value = share of shifted signals that scored at least as well (p ≤ 0.10 is suggestive, ≤ 0.05 is better). "
-                       "This is a fair test only for a strategy chosen BEFORE seeing the final test.")
+                       + ("This is a fair test only for a strategy chosen BEFORE seeing the final test." if REVEAL else
+                          "In research mode this is run on the validation period, which you may have used for choices, so it is optimistic."))
 
-        st.markdown("**Cost stress** (first signal, final test)")
+        st.markdown(f"**Cost stress** (first signal, {grade_name.lower()})")
         crow = []
         for b_ in sorted({0, bps, 50, 100}):
             rr, tt, WW = bt_one(m, pairs[0][1], aux, mode, b_, impl_key)
-            pp = perf(seg(rr, tt, WW, test_bt)[0], rf_all)
+            pp = perf(seg(rr, tt, WW, grade_bt)[0], rf_all)
             crow.append({"Cost (bps per 100% traded)": b_, "CAGR": pc(pp["CAGR"]), "Sharpe": fm("Sharpe", pp["Sharpe"]), "Max drawdown": pc(pp["Max drawdown"])})
         show_df(st, pd.DataFrame(crow))
 
@@ -1611,7 +2081,8 @@ with T["bt"]:
                 ex = r_full - rf_all.reindex(r_full.index).fillna(0)
                 rs_ = ex.rolling(36).mean() * 12 / (r_full.rolling(36).std() * np.sqrt(12))
                 roll.add_scatter(x=rs_.index, y=rs_, name=nm_)
-            vmark(roll, test_bt[0], "final test starts")
+            if REVEAL:
+                vmark(roll, test_bt[0], "final test starts")
             roll.update_layout(title="Rolling 36-month Sharpe (does it work in every era, or only in some?)", height=340)
             show_plot(st, roll)
 
@@ -1625,51 +2096,65 @@ with T["bt"]:
                         continue
                     ret, turn, W = bt_one(m, v_, aux, strat, bps, impl_key)
                     rv, nv, iv = seg(ret, turn, W, val_bt)
-                    rt, nt, it = seg(ret, turn, W, test_bt)
-                    if len(rv) < 12 or len(rt) < 12:
+                    if len(rv) < 12:
                         continue
-                    pv, pt = perf(rv, rf_all, iv, nv), perf(rt, rf_all, it, nt)
+                    pv = perf(rv, rf_all, iv, nv)
+                    if REVEAL:
+                        rt, nt, it = seg(ret, turn, W, test_bt)
+                        if len(rt) < 12:
+                            continue
+                        pt = perf(rt, rf_all, it, nt)
+                    else:
+                        pt = perf(rv.iloc[:0], rf_all)  # all NaN: the final test is hidden
                     lab = "No macro signal" if strat in NO_SIGNAL else sname
                     res.append(dict(key=f"{lab} · {strat}", signal=lab, strat=strat, v_src=v_, pv=pv, pt=pt, v=pv[rank_by], t=pt[rank_by], ret=ret))
             bsv = perf(bench_curves(m, val_bt, impl_key)["Silver buy & hold"], rf_all)[rank_by]
-            bst = perf(bench_curves(m, test_bt, impl_key)["Silver buy & hold"], rf_all)[rank_by]
+            bst = perf(bench_curves(m, test_bt, impl_key)["Silver buy & hold"], rf_all)[rank_by] if REVEAL else np.nan
             if not res:
                 st.info("No strategy had enough months to rank.")
             else:
                 res.sort(key=lambda r_: -np.inf if pd.isna(r_["v"]) else r_["v"], reverse=True)
                 medals = ["🥇", "🥈", "🥉"]
-                lb = pd.DataFrame([{
-                    "#": medals[i] if i < 3 else str(i + 1), "Signal": r_["signal"], "Strategy": r_["strat"],
-                    f"{rank_by} (validation)": fm(rank_by, r_["v"]), "CAGR (validation)": pc(r_["pv"]["CAGR"]),
-                    f"{rank_by} (final test)": fm(rank_by, r_["t"]), "CAGR (final test)": pc(r_["pt"]["CAGR"]),
-                    "Max DD (final test)": pc(r_["pt"]["Max drawdown"]), "% invested (test)": pc(r_["pt"]["% invested"], False),
-                    "Trades (test)": r_["pt"]["Trades"],
-                    "Beats silver on both?": "✅" if (pd.notna(r_["v"]) and pd.notna(r_["t"]) and r_["v"] > bsv and r_["t"] > bst) else "❌"}
-                    for i, r_ in enumerate(res)])
-                show_df(st, lb)
-                st.caption(f"Silver buy & hold for reference: {rank_by} {fm(rank_by, bsv)} on validation, {fm(rank_by, bst)} on the final test. "
-                           "Only the validation column was used for ranking; the final-test column is a grade, not a selection criterion.")
-
+                lrows = []
+                for i, r_ in enumerate(res):
+                    row = {"#": medals[i] if i < 3 else str(i + 1), "Signal": r_["signal"], "Strategy": r_["strat"],
+                           f"{rank_by} (validation)": fm(rank_by, r_["v"]), "CAGR (validation)": pc(r_["pv"]["CAGR"])}
+                    if REVEAL:
+                        row.update({f"{rank_by} (final test)": fm(rank_by, r_["t"]), "CAGR (final test)": pc(r_["pt"]["CAGR"]),
+                                    "Max DD (final test)": pc(r_["pt"]["Max drawdown"]), "% invested (test)": pc(r_["pt"]["% invested"], False),
+                                    "Trades (test)": r_["pt"]["Trades"],
+                                    "Beats silver on both?": "✅" if (pd.notna(r_["v"]) and pd.notna(r_["t"]) and r_["v"] > bsv and r_["t"] > bst) else "❌"})
+                    else:
+                        row.update({"Max DD (validation)": pc(r_["pv"]["Max drawdown"]), "% invested (validation)": pc(r_["pv"]["% invested"], False),
+                                    "Trades (validation)": r_["pv"]["Trades"], "Beats silver (validation)?": "✅" if (pd.notna(r_["v"]) and r_["v"] > bsv) else "❌"})
+                    lrows.append(row)
+                show_df(st, pd.DataFrame(lrows))
                 pick = res[0]
-                t_sorted = sorted([r_["t"] for r_ in res if pd.notna(r_["t"])], reverse=True)
-                rank_t = t_sorted.index(pick["t"]) + 1 if pd.notna(pick["t"]) else len(res)
-                msg = (f"**Locked pick (best on validation): {pick['strat']}** with **{pick['signal']}**. "
-                       f"Validation {rank_by} {fm(rank_by, pick['v'])} → untouched final test {fm(rank_by, pick['t'])} "
-                       f"(silver buy & hold {fm(rank_by, bst)}). On the final test it ranks **{rank_t} of {len(res)}**.")
-                good_pick = pd.notna(pick["t"]) and pick["t"] > bst and rank_t <= max(1, len(res) // 3)
-                if run_perm:
-                    ptest, med_, p95_ = perm_p(shift_null(m, pick["v_src"], aux, pick["strat"], bps, impl_key, test_bt.values, rank_by), pick["t"])
-                    if pd.notna(ptest):
-                        msg += f" Randomization test on the final test: p = {ptest:.2f} (random median {fm(rank_by, med_)}, 95th percentile {fm(rank_by, p95_)})."
-                        good_pick = good_pick and ptest <= 0.10
-                (st.success if good_pick else st.warning)(msg)
-
+                if REVEAL:
+                    st.caption(f"Silver buy & hold for reference: {rank_by} {fm(rank_by, bsv)} on validation, {fm(rank_by, bst)} on the final test. "
+                               "Only the validation column was used for ranking; the final-test column is a grade, not a selection criterion.")
+                    t_sorted = sorted([r_["t"] for r_ in res if pd.notna(r_["t"])], reverse=True)
+                    rank_t = t_sorted.index(pick["t"]) + 1 if pd.notna(pick["t"]) else len(res)
+                    msg = (f"**Locked pick (best on validation): {pick['strat']}** with **{pick['signal']}**. "
+                           f"Validation {rank_by} {fm(rank_by, pick['v'])} → final test {fm(rank_by, pick['t'])} "
+                           f"(silver buy & hold {fm(rank_by, bst)}). On the final test it ranks **{rank_t} of {len(res)}**.")
+                    good_pick = pd.notna(pick["t"]) and pick["t"] > bst and rank_t <= max(1, len(res) // 3)
+                    if run_perm:
+                        ptest, med_, p95_ = perm_p(shift_null(m, pick["v_src"], aux, pick["strat"], bps, impl_key, test_bt.values, rank_by), pick["t"])
+                        if pd.notna(ptest):
+                            msg += f" Randomization test on the final test: p = {ptest:.2f} (random median {fm(rank_by, med_)}, 95th percentile {fm(rank_by, p95_)})."
+                            good_pick = good_pick and ptest <= 0.10
+                    (st.success if good_pick else st.warning)(msg)
+                else:
+                    st.caption(f"Silver buy & hold for reference: {rank_by} {fm(rank_by, bsv)} on validation. The final test is hidden in research mode.")
+                    st.info(f"Current validation leader: **{pick['strat']}** with **{pick['signal']}** ({rank_by} {fm(rank_by, pick['v'])}). "
+                            "Freeze your settings, switch to Locked evaluation and reveal the final test to grade it once.")
                 top_curves = {r_["key"]: r_["ret"].reindex(bt_all).dropna() for r_ in res[:3]}
                 top_curves.update({k_: v_ for k_, v_ in bench_curves(m, bt_all, impl_key).items() if k_ in ("Silver buy & hold", "Gold buy & hold")})
-                show_plot(st, growth_chart(top_curves, bt_all, "Top 3 on validation, followed through the final test", mark=test_bt[0]))
+                show_plot(st, growth_chart(top_curves, bt_all, "Top 3 on validation" + (", followed through the final test" if REVEAL else ""), mark=test_bt[0] if REVEAL else None))
                 st.warning(f"{len(res)} candidates were compared on the validation period, so the validation winner is flattered by selection. "
-                           "The final test is the honest grade: trust a strategy only if it also beats silver buy & hold there, ranks high there, and survives the randomization test. "
-                           "Once you have looked at the final-test column and changed settings because of it, it stops being untouched.")
+                           "Trust a strategy only if it also beats silver buy & hold on the final test, ranks high there, and survives the randomization test. "
+                           "Once you have looked at the final test and changed settings because of it, it stops being untouched (the counter above tracks this).")
 
 # ------------------------------------------------------------------ robustness
 with T["rob"]:
@@ -1685,37 +2170,48 @@ with T["rob"]:
         c3.metric("Expected to pass by pure luck", f"{n_t * p_thr:.1f}")
         c4.metric("Survive FDR q ≤ 0.10 / 0.25", f"{int((stats['q'] <= 0.10).sum())} / {int((stats['q'] <= 0.25).sum())}")
         st.caption("If the number passing is close to the number expected by luck, the rules are mostly noise. Switch 'Select environments by' to the FDR q-value in the sidebar to keep only environments that survive the adjustment. "
-                   "(The luck estimate treats tests as independent; indicators overlap, so it is rough.)")
+                   "(The luck estimate treats tests as independent; indicators overlap, so it is rough. Factor compression in the sidebar reduces that overlap.)")
         best_q = stats.sort_values("q").head(8)
         show_df(st, pd.DataFrame({"Environment": [state_label(r.col, r.state) for r in best_q.itertuples()],
                                   "Indicator": [META[r.col][0] for r in best_q.itertuples()], "HAC t": [f"{v:+.1f}" for v in best_q["t"]],
                                   "Raw p": [f"{v:.3f}" for v in best_q["p"]], "FDR q": [f"{v:.2f}" for v in best_q["q"]],
                                   "Both halves?": ["✅" if v else "❌" for v in best_q["consistent"]]}))
 
+    if fac_mode:
+        st.subheader("Factor composition")
+        if fac_members:
+            show_df(st, pd.DataFrame([{"Factor": META_ALL[k][0], "Pillar": META_ALL[k][4], "Members": ", ".join(META_ALL[c][0] for c in v)}
+                                      for k, v in fac_members.items()]))
+            st.caption(f"Indicators were merged when their average |Spearman correlation| on the early learn period was at least {fac_thr:.2f}. "
+                       "Each factor is the average of the members' z-scores (signs aligned to the lead indicator); 'factor high' means high in the lead indicator's direction. "
+                       "Indicators not listed here had no close relatives and stay as they are.")
+        else:
+            st.info("No indicators were correlated enough to merge at this threshold. Lower the merge threshold in the sidebar.")
+
     st.subheader("Parameter sensitivity")
-    fr_grid = tuple(f for f in (0.4, 0.5, 0.6, 0.7) if f <= train_frac + val_frac + 1e-9)
+    fr_grid = tuple(f for f in (0.4, 0.5, 0.6, 0.7) if f <= train_frac + val_frac + 1e-9) if REVEAL else tuple(f for f in (0.3, 0.4, 0.5, 0.6) if f <= train_frac + 1e-9)
     if fr_grid:
-        sens = sensitivity(F_ok, P_ok, fwd, h, fr_grid, (0.5, 1.0, 1.5, 2.0, 2.5), need_consistent, cfg[3], test_idx.values)
+        sens = sensitivity(F_ok, P_ok, fwd, h, fr_grid, (0.5, 1.0, 1.5, 2.0, 2.5), need_consistent, cfg[3], grade_idx.values)
         zs = sens.values
         lim = np.nanmax(np.abs(zs)) if np.isfinite(zs).any() else 5
         sf = go.Figure(go.Heatmap(z=zs, x=list(sens.columns), y=list(sens.index), colorscale="RdYlGn", zmid=0, zmin=-lim, zmax=lim,
                                   text=[[("" if np.isnan(v) else f"{v:+.1f}") for v in row] for row in zs], texttemplate="%{text}",
                                   showscale=False, xgap=3, ygap=3))
-        sf.update_layout(title="Final test: Favorable minus Unfavorable (pts) for different learn shares and t thresholds",
+        sf.update_layout(title=f"{grade_name}: Favorable minus Unfavorable (pts) for different learn shares and t thresholds",
                          xaxis_title="Minimum HAC t-stat", yaxis_title="Share of history used to learn", height=320)
         show_plot(st, sf)
         nz = int(np.isfinite(zs).sum())
         npos = int((zs[np.isfinite(zs)] > 0).sum())
         (st.success if nz and npos / nz >= 0.8 else st.warning)(
-            f"{npos} of {nz} parameter settings keep Favorable ahead of Unfavorable on the final test. "
+            f"{npos} of {nz} parameter settings keep Favorable ahead of Unfavorable on the {grade_name.lower()}. "
             + ("A robust finding survives most settings." if nz and npos / nz >= 0.8 else "If the result only works at one setting, it is fragile."))
     else:
         st.info("Increase the learn + validation share to enable the sensitivity grid.")
 
     st.subheader("Is an indicator's strength stable through time?")
-    rk_top = indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h)
+    rk_top = indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h, fdd)
     top_cols = list(rk_top["col"].head(5))
-    ric = rolling_ic(F_ok, fwd, tuple(top_cols), 60)
+    ric = rolling_ic(F_ok, fwd.where(fwd.index.isin(ev_r)), tuple(top_cols), 60)
     if not ric.dropna(how="all").empty:
         rf_ = go.Figure()
         for c in top_cols:
@@ -1726,7 +2222,7 @@ with T["rob"]:
         st.caption("Lines that sit on one side of zero for the whole period are stable. Lines that cross zero repeatedly (or used to be strong and faded) describe relationships that come and go. "
                    "Windows overlap heavily, so wiggles are smoother than the true uncertainty.")
 
-    st.subheader("Redundancy between indicators")
+    st.subheader("Redundancy between indicators" + (" (after factor compression)" if fac_mode else ""))
     cm = F_ok.corr(method="spearman")
     cf_ = go.Figure(go.Heatmap(z=cm.values, x=[META[c][0] for c in cm.columns], y=[META[c][0] for c in cm.index], zmin=-1, zmax=1,
                                colorscale="RdBu", reversescale=True, showscale=True))
@@ -1734,7 +2230,7 @@ with T["rob"]:
     show_plot(st, cf_)
     pairs_hi = [(cm.index[i], cm.columns[j], cm.iloc[i, j]) for i in range(len(cm)) for j in range(i + 1, len(cm)) if abs(cm.iloc[i, j]) >= 0.8]
     if pairs_hi:
-        st.markdown("**Highly overlapping pairs (|rank correlation| ≥ 0.8)** — they vote twice for the same story:")
+        st.markdown("**Highly overlapping pairs (|rank correlation| ≥ 0.8)** — they vote twice for the same story (tick factor compression in the sidebar to merge them):")
         st.markdown("\n".join(f"- {META[a][0]} ↔ {META[b][0]} ({r:+.2f})" for a, b, r in sorted(pairs_hi, key=lambda x: -abs(x[2]))))
     else:
         st.caption("No pair of selected indicators has |rank correlation| ≥ 0.8.")
@@ -1746,7 +2242,8 @@ with T["exp"]:
     e1, e2 = st.columns(2)
     ind_x = e1.selectbox("Indicator", list(META), format_func=lambda c: META[c][0], key="exp_ind")
     st_x = e2.selectbox("State", STATES, format_func=lambda s_: state_label(ind_x, s_), key="exp_state")
-    sel_idx = S.index[(S[ind_x] == st_x).fillna(False).values]
+    allowed = S.index if REVEAL else S.index[S.index <= test_idx[0] - pd.DateOffset(months=12)]
+    sel_idx = S.index[(S[ind_x] == st_x).fillna(False).values].intersection(allowed)
     st.markdown(f"**{len(sel_idx)} months** in this state ({len(sel_idx) / len(S):.0%} of history). "
                 f"Now: **{state_label(ind_x, S.loc[now, ind_x])}** (value {fmt_val(ind_x, F_ok.loc[now, ind_x])}).")
     rows = []
@@ -1754,8 +2251,10 @@ with T["exp"]:
         row = {"Horizon": f"{h_} months"}
         for nm_, kd in (("Silver", "ret"), ("Gold", "goldabs"), ("Silver − gold", "gold")):
             r = target_returns(m, F_ok.index, h_, kd).reindex(sel_idx).dropna()
-            base_r = target_returns(m, F_ok.index, h_, kd).dropna()
+            base_r = target_returns(m, F_ok.index, h_, kd).reindex(allowed).dropna()
             row[nm_] = "-" if r.empty else f"{r.mean():+.1%} ({(r > 0).mean():.0%} up, n={len(r)}; all months {base_r.mean():+.1%})"
+        d_dd = fwd_drawdown(m["silver"], h_).reindex(sel_idx).dropna()
+        row["Silver typical max drawdown"] = "-" if d_dd.empty else f"{d_dd.median():.0%}"
         rows.append(row)
     show_df(st, pd.DataFrame(rows))
     with st.expander("List the months"):
@@ -1767,11 +2266,11 @@ if run_ml:
         st.markdown(f"""
 Each model estimates the **probability that {tgt_txt}** in {h} months, retrained every {step} months on data whose outcome was already known at that time.
 Scores below use only months whose outcome is known now. **AUC** 0.50 = coin flip, 0.55-0.60 = modest skill, above 0.65 would be suspicious; the bracket is a 95% block-bootstrap range.
-**Brier skill** > 0 means the probabilities beat just quoting the normal odds. **Log loss** punishes confident mistakes (lower is better). **Rank IC** = rank correlation between the probability and the actual return.
+**Brier skill** > 0 means the probabilities beat just quoting the normal odds. **Log loss** punishes confident mistakes (lower is better). **Rank IC** = rank correlation between the probability and the actual outcome.
 """)
         rows = []
         for name, wf in ml.items():
-            wk = known(wf, fwd)
+            wk = known(wf, fwd, unseen_idx)
             if wk.empty:
                 continue
             yy = (fwd.loc[wk.index] > 0).astype(int)
@@ -1785,11 +2284,11 @@ Scores below use only months whose outcome is known now. **AUC** 0.50 = coin fli
                          "Brier skill": f"{bss:+.3f}", "Log loss": f"{ll:.3f}", "Rank IC": f"{rank_ic(wk['p'], fwd.loc[wk.index]):+.2f}",
                          "Accuracy": f"{((wk['p'] > 0.5) == yy).mean():.0%}", "Naive": f"{((wk['base'] > 0.5) == yy).mean():.0%}",
                          "Favorable minus Unfavorable": "-" if np.isnan(sp_) else f"{sp_:+.1f} pts"})
-        st.subheader("Out-of-sample comparison (validation + final test months)")
+        st.subheader(f"Out-of-sample comparison ({unseen_lbl} months)")
         show_df(st, pd.DataFrame(rows))
         st.caption("Simple vs complex: if logistic regression scores about the same as the forests, the extra complexity is not buying anything.")
         wf = ml[ml_choice]
-        wk = known(wf, fwd)
+        wk = known(wf, fwd, unseen_idx)
         if wk.empty:
             st.warning("Not enough history to train. Move the start date earlier.")
         else:
@@ -1848,15 +2347,17 @@ Each look-ahead is fitted on the **first 70% of the learning period** and scored
 with T["now"]:
     st.subheader(f"✅ Silver & gold: where the environment stands now ({now:%b %Y})")
     st.caption(f"Each market gets its own rules and ML read for the next {h} months, using the same indicators and settings. "
-               "Favorable / Unfavorable describes how similar environments played out historically. It is not a buy or sell instruction.")
+               "Favorable / Unfavorable describes how similar environments played out historically. It is not a buy or sell instruction. "
+               "These three reads always use plain return targets (silver, gold, silver minus gold), whatever target is selected in the sidebar.")
 
     for col, k in zip(st.columns(3), NOW_KINDS):
         r = NOW[k]
         box = card(col)
         box.markdown(f"### {r['icon']} {NOW_NAMES[k]}")
         box.markdown(f"**{REL_TXT[r['label']] if k == 'gold' else r['label']}**")
-        box.markdown(f"**Confidence: {r['conf']}** ({r['agree']} of {r['n_votes']} views agree)")
+        box.markdown(f"**Confidence: {r['conf']}** ({r['agree']} of {r['n_votes']} evidence channels agree)")
         box.markdown(" · ".join(f"{n_} {VICON[v]}" for n_, v in r["votes"].items()))
+        box.caption("Macro models = " + ", ".join(f"{n_} {VICON[v]}" for n_, v in r["comps"].items()))
         box.markdown(f"Rules: {ICON[r['rules']]} {r['rules']} (score {r['score']:+.1f})")
         if r["ml"]:
             box.markdown(f"ML: {r['ml']['p']:.0%} chance {NOW_PHRASE[k]} in {h}m (normal {r['ml']['base']:.0%}) → {ICON[r['ml']['verdict']]} {r['ml']['verdict']}")
@@ -1907,7 +2408,7 @@ with T["now"]:
         "ML chance": "-" if not NOW[k]["ml"] else f"{NOW[k]['ml']['p']:.0%} (normal {NOW[k]['ml']['base']:.0%})",
         "Similar periods, median": pc(NOW[k]["ana_med"]),
         "Evidence": NOW[k]["ev_level"]} for k in NOW_KINDS]))
-    st.caption("Confidence combines two things: how many independent views (rules, ML, similar past periods, price momentum) point the same way, "
+    st.caption("Confidence combines two things: whether the two evidence channels (macro models, which share the same indicators, and price trend) point the same way, "
                "and whether the rules beat chance on unseen data. It is a rough guide, not a probability.")
     st.warning("**Educational only, not financial advice.** This reads macro conditions only. It does not know about valuation, news, taxes, "
                "your goals or your time horizon, and relationships that held in the past can stop working.")
