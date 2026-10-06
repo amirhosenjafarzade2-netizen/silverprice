@@ -1,5 +1,5 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v4.3
+Silver Macro Environment Analyzer (Streamlit), v4.4
 
 Which macro environments have been historically favorable / unfavorable for silver (and gold), what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
@@ -8,24 +8,20 @@ requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-l
 Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access (and for first-release / ALFRED data).
 Educational only, not financial advice.
 
-v4.3 changes (second methodology review):
-- LOCKED MODE REALLY LOCKS. While the final test is revealed, every setting widget is disabled. To change anything you must untick
-  "reveal", which hides the final test again. The peek counter now also covers vintage data, factor mode, auto-horizon and leaderboard settings.
-- FACTOR COMPRESSION (optional). Correlated indicators (average-linkage |Spearman| >= threshold, measured on the early part of the learn
-  period only, no outcomes involved) are merged into one factor = average of sign-aligned z-scores. Uncorrelated indicators stay as they are.
-  This attacks the "many indicators vote for the same story" problem that FDR does not solve.
-- PREDICTIVE ANALOGUES. Besides the descriptive 10-closest-months table, every unseen month now searches ONLY months whose outcome was already
-  known at that time. Scored on unseen months, and available as a backtest signal ("Analogues (expanding)").
-- TWO DRAWDOWN TARGETS. "Avoids a deep drawdown (yes / no)" (classification) and "Forward max drawdown (continuous)" (keeps the magnitude).
-- MORE POINT-IN-TIME DATA. First-release (ALFRED) values now also cover the Philly Fed survey and NFCI (needs a FRED key). It is ON by default when a key exists.
-- CFTC release dates are computed from the Tuesday as-of date plus the Friday release, pushed past US federal holidays and weekends
-  (the CFTC API does not return a publication date), instead of a flat +3 days.
-- Futures mode now carries an explicit warning (continuous front-month series, roll gaps inside returns). ETF stays the default.
-  ETF fees need no extra deduction: SLV / GLD prices are NAV-based and already net of their expense ratios.
+v4.4 changes (third review):
+- ABLATIONS (Robustness tab). Factors on/off, factor merge threshold x sign alignment, and vintage data on/off, each refitted on the learn period
+  and graded on the grading period. Diagnostics only, not a menu to pick the best row from.
+- FACTOR STABILITY. Share of merged indicator pairs that are identical when the factor structure is rebuilt on each half of the structure window.
+- SIGN-ALIGNMENT SWITCH inside build_factors (used by the ablation).
+- SIGNAL COMPARISON table: single-fit rules vs expanding rules vs expanding analogues on the same graded months.
+- DESCRIPTIVE vs TRADABLE analogues are now labelled as such everywhere.
+- IMPLEMENTATION CHECK in the Backtest tab: ETF and futures side by side for the chosen strategy.
+- CFTC release dates are described as a constructed, conservative estimate that should be audited against the CFTC release calendar.
 
-v4.2 changes: research vs locked evaluation modes with a peek counter, expanding-window rules, evidence channels instead of independent views,
-optional first-release data for M2 / CPI / industrial production / unemployment, T-bill collateral on futures, compounded cash, shrunk strength weights.
-v4.1 changes: risk-aware targets, risk-adjusted indicator ranking, optional supply / demand / positioning proxies.
+v4.3: locked mode really locks, optional factor compression, predictive analogues, two drawdown targets, more point-in-time data (ALFRED),
+CFTC release dates computed from the Tuesday as-of date, futures warning.
+v4.2: research vs locked evaluation modes with a peek counter, expanding-window rules, evidence channels, optional first-release data, T-bill collateral, compounded cash.
+v4.1: risk-aware targets, risk-adjusted indicator ranking, optional supply / demand / positioning proxies.
 """
 import hashlib
 import io
@@ -254,9 +250,10 @@ def _fred_fetch(series_id, start, key):
 
 
 def _cot_release_dates(dates):
-    """Release date of each COT report. The API gives only the Tuesday as-of date, so the release is computed: Friday of that week,
+    """Estimated release date of each COT report. The API gives only the Tuesday as-of date, so the release is CONSTRUCTED: Friday of that week,
     one business day later if a US federal holiday falls between the Monday of the report week and that Friday (conservative), and rolled
-    forward past weekends / holidays. Conservative means never earlier than the real release, so no look-ahead."""
+    forward past weekends / holidays. Conservative means never earlier than the real release, so no look-ahead.
+    It is still an estimate: audit it against the CFTC's published release calendar before relying on it."""
     try:
         hol = USFederalHolidayCalendar().holidays(start=dates.min() - pd.Timedelta(days=10),
                                                   end=dates.max() + pd.Timedelta(days=20)).values.astype("datetime64[D]")
@@ -464,10 +461,11 @@ def build_features(m):
 
 
 # ------------------------------------------------------------------ factor compression
-def build_factors(F_src, learn_idx, thr):
+def build_factors(F_src, learn_idx, thr, align=True):
     """Merge correlated indicators into factors WITHOUT using any outcome.
     Groups are built by average-linkage on |Spearman| measured on learn_idx only (the early part of the learn period). A group with 2+ members becomes
-    one factor = average of sign-aligned z-scores (z-score stats from learn_idx, clipped at +-4). Singletons keep their original column.
+    one factor = average of z-scores (z-score stats from learn_idx, clipped at +-4), sign-aligned to the group's lead indicator when align=True.
+    Singletons keep their original column.
     Returns (factor frame, META-style dict for the new factor columns, {factor column: member list})."""
     cols = list(F_src.columns)
     L = F_src.loc[learn_idx, cols]
@@ -498,7 +496,7 @@ def build_factors(F_src, learn_idx, thr):
         z = []
         for n in names:
             c_ = sp.loc[n, lead]
-            sgn = 1.0 if (n == lead or not (c_ < 0)) else -1.0
+            sgn = 1.0 if (not align or n == lead or not (c_ < 0)) else -1.0
             z.append(sgn * ((F_src[n] - mu[n]) / sd[n]).clip(-4, 4))
         key = "fac_" + "+".join(names)
         out[key] = pd.concat(z, axis=1).mean(axis=1)
@@ -506,6 +504,24 @@ def build_factors(F_src, learn_idx, thr):
         meta[key] = (f"Factor: {lt[0]} + {len(names) - 1} related", f"{lt[1]} (factor low)", f"{lt[2]} (factor high)", False, lt[4])
         members[key] = names
     return pd.DataFrame(out, index=F_src.index), meta, members
+
+
+def group_stability(F_src, idx, thr):
+    """Overlap (Jaccard) of merged indicator pairs when the factor structure is rebuilt on each half of the structure window.
+    Near 100% = the same indicators get merged in both halves (stable). Low = the factor structure depends on the sample."""
+    half = len(idx) // 2
+
+    def pairs(ix):
+        _, _, mem = build_factors(F_src, ix, thr)
+        s = set()
+        for v in mem.values():
+            for i in range(len(v)):
+                for j in range(i + 1, len(v)):
+                    s.add((v[i], v[j]))
+        return s
+
+    a, b = pairs(idx[:half]), pairs(idx[half:])
+    return len(a & b) / len(a | b) if (a | b) else np.nan
 
 
 # ------------------------------------------------------------------ statistics
@@ -771,6 +787,15 @@ def _run_rules_c(F_ok, P, fwd, learn_vals, h, cfg):
 def run_rules(F_ok, P, fwd, learn_idx, h, cfg):
     """Cached. (Streamlit cannot hash a pandas Index, so it is passed as a plain array.)"""
     return _run_rules_c(F_ok, P, fwd, pd.DatetimeIndex(learn_idx).values, h, cfg)
+
+
+def spread_for(F_x, P_x, fwd, learn_idx, grade_idx, h, cfg):
+    """Favorable minus Unfavorable (pts) on the grading period for rules fitted on learn_idx, plus the number of rules kept."""
+    _, _, g_, b_, _, v_ = run_rules(F_x, P_x, fwd, learn_idx, h, cfg)
+    ts = summarize(fwd, v_, grade_idx, h).set_index("Group")
+    if ts.loc[FAV, "Months"] < 3 or ts.loc[UNF, "Months"] < 3:
+        return np.nan, len(g_) + len(b_)
+    return (ts.loc[FAV, "Avg"] - ts.loc[UNF, "Avg"]) * 100, len(g_) + len(b_)
 
 
 def rank_ic(a, b):
@@ -1503,10 +1528,11 @@ if len(chosen) < 3:
 base_cols = list(chosen)
 F_ok = F_all[base_cols].dropna()
 F_src, fac_members = F_full[base_cols].dropna(), {}
+F_raw = F_src  # raw (uncompressed) indicators, kept for the ablations
+n_l = max(int(len(F_ok) * train_frac) - max(HORIZONS), 36)
+struct_idx = F_ok.index[:n_l]  # structure window for factors: early learn period only, no outcomes involved
 if fac_mode:
-    # structure is learned from the first part of the learn period only (minus the longest look-ahead), and uses no outcomes at all
-    n_l = max(int(len(F_ok) * train_frac) - max(HORIZONS), 36)
-    F_src, fmeta, fac_members = build_factors(F_src, F_ok.index[:n_l], fac_thr)
+    F_src, fmeta, fac_members = build_factors(F_src, struct_idx, fac_thr)
     META_ALL.update(fmeta)
     F_ok = F_src.loc[F_ok.index]
 P_ok = None
@@ -1665,13 +1691,13 @@ with T["dash"]:
         st.markdown(f"**Persistence:** {cur.lower()} for **{n_cur}** month(s) (typical run: {med:.0f}). "
                     + (f"After 3+ months in this state, the average outcome was {avg_h:+.1%} ({n_h} months)." if n_h >= 5 else ""))
     with cr:
-        st.markdown(f"**10 most similar past environments** → outcome after {h} months ({target_name.lower()})")
+        st.markdown(f"**10 most similar past environments (descriptive, NOT tradable)** → outcome after {h} months ({target_name.lower()})")
         a = ana["After"]
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Median", pc(a.median())); k2.metric("Average", pc(a.mean())); k3.metric("Positive", f"{(a > 0).mean():.0%}")
         k4.metric("Worst", pc(a.min())); k5.metric("Best", pc(a.max()))
         st.caption("Only 10 observations: indicative, not statistical proof. Descriptive: the search uses all history available" + ("" if REVEAL else " (final test excluded in research mode)")
-                   + ". The Regimes & analogues tab has a fair, expanding-database version of this test.")
+                   + ". It is not a trading signal. The Regimes & analogues tab has a fair, expanding-database (tradable) version of this test.")
 
     with st.expander("What would change the rules' verdict?"):
         th = state_thresholds(F_ok, learn_idx, pit)
@@ -1708,21 +1734,24 @@ with T["guide"]:
 - **Environments (rules):** each month is described by {len(META)} {'factors / indicators' if fac_mode else 'macro indicators'}, each split into Low/Neutral/High (fixed terciles from the learn period, or point-in-time percentiles).
   We measure the {h}-month outcome in each bucket and keep environments that are statistically clear (HAC t-stat, or FDR q-value to account for testing dozens of buckets) and hold in both halves of the learn period.
 - **Factor compression (optional).** FDR handles many tests but not correlated predictors. With factor mode on, indicators that move together (average-linkage |Spearman| ≥ the chosen threshold, measured on the early learn period only,
-  no outcomes involved) become one factor: the average of their sign-aligned z-scores. Indicators with no close relatives stay as they are. See the Robustness tab for the composition.
+  no outcomes involved) become one factor: the average of their sign-aligned z-scores. Indicators with no close relatives stay as they are. The equal-weight average is a deliberate choice: learned weights would use outcomes and break the anti-leakage design.
+  The Robustness tab shows the composition, how stable it is across the two halves of the structure window, and ablations over the merge threshold and sign alignment.
 - **Indicator ranking:** correlation with the outcome on learn and unseen data, a drop-one test, plus two risk-aware descriptive columns: the High-minus-Low gap in standard deviations of the outcome,
   and the typical drawdown after High versus Low states.
 - **Machine learning:** three models estimate the chance that *{tgt_txt}*, retrained walk-forward on data whose outcomes were known at the time. AUC comes with a bootstrap confidence interval.
-- **Analogues:** the 10-closest-months table is descriptive (it searches all history). The predictive test searches, for every unseen month, only months whose outcome was already known then, and is scored on unseen months.
+- **Analogues come in two kinds.** The 10-closest-months table is **descriptive and not tradable** (it searches all history). The **predictive analogue test** is the tradable version: for every unseen month it searches only months whose outcome was already known then, and is scored on unseen months.
 - **Backtest:** ten strategies on ETFs (default) or futures with trading costs. Besides benchmarks it compares against a **no-timing mix with the same average exposure**,
-  and runs a **randomization test** (signal shifted in time) so you can see how often luck would have done as well.
-- **Robustness:** multiple-testing summary, parameter-sensitivity grid, rolling indicator strength, indicator redundancy, factor composition.
+  runs a **randomization test** (signal shifted in time) so you can see how often luck would have done as well, and shows an **implementation check** (ETF vs futures side by side).
+- **Robustness:** multiple-testing summary, factor composition and stability, **ablations** (factors, merge threshold, sign alignment, vintage data), signal comparison, parameter-sensitivity grid, rolling indicator strength, indicator redundancy.
+  The ablations are diagnostics, not a menu: picking the best row would be selection on the grading period.
 - **Silver & gold now:** separate reads for silver, gold and silver-versus-gold, with a confidence level that combines how many evidence channels agree and whether the rules worked on unseen data.
 
 ### Supply, demand and positioning (optional pillar)
 - There is **no free, point-in-time dataset of physical silver supply and demand** (mine output, recycling, industrial use, inventories). The Silver Institute and USGS balances are annual, published months late and revised.
 - The app therefore offers proxies, switched off by default: **CFTC managed-money net position** in COMEX silver (% of open interest, weekly),
   **silver miners (SIL) versus silver**, and **solar stocks (TAN)** as an industrial-demand proxy. SIL starts in 2010 and TAN in 2008, so enabling them shortens the usable history and the three-way split.
-- The CFTC API gives only the Tuesday as-of date. The release date is computed as the Friday of that week, pushed one business day later around US federal holidays and rolled past weekends (conservative: never earlier than the real release).
+- The CFTC API gives only the Tuesday as-of date, so the release date is a **constructed, conservative estimate**: the Friday of that week, pushed one business day later around US federal holidays and rolled past weekends (never earlier than the real release, so no look-ahead).
+  It is still an estimate: audit it against the CFTC's published release calendar before relying on it.
 
 ### Evaluation discipline
 - **Research vs Locked.** In Research mode the final test is hidden everywhere and every grade uses validation only. In Locked mode you reveal it and **every setting is frozen**; the app counts how many different sets of settings the final test has been shown for.
@@ -1731,12 +1760,13 @@ with T["guide"]:
 - **Evidence channels.** Rules, ML and analogues share the same indicators, so they count as one macro channel. Price trend is the second. Confidence is High only if both agree and the rules worked on unseen data.
 - **First-release data (optional, needs a FRED key, on by default when a key exists).** M2, CPI, industrial production, unemployment, the Philly Fed survey and NFCI use first-release values and release dates.
   Observations older than FRED's first archived vintage carry that earliest archived value, so very early history is only partly point-in-time.
-- Still not done: nested hyperparameter selection inside every walk-forward fold, and contract-level futures rolls.
+- Still not done: nested hyperparameter selection inside every walk-forward fold, contract-level futures rolls, and PCA or other learned factor weights.
 
 ### Known limits (read these)
 - **Publication lags are approximations** (see PUB_LAG in the code) wherever first-release data is switched off or unavailable.
 - **Futures are continuous front-month contracts** from Yahoo, so roll gaps are inside the returns and the futures backtest is not a real roll simulation. The ETF option (SLV / GLD) avoids that.
-  ETF prices are NAV-based and already net of the expense ratio, so no extra fee is deducted (that would double count). The ETF option starts in 2006 (SLV) / 2004 (GLD).
+  ETF prices are NAV-based and already net of the expense ratio, so no extra fee is deducted (that would double count). ETF prices can still differ from spot-market behaviour, so the Backtest tab shows both implementations side by side.
+  The ETF option starts in 2006 (SLV) / 2004 (GLD).
 - **Credit spread** is Moody's Baa minus 10y (full history on FRED). ICE BofA high-yield spreads are limited to recent years on FRED, and the ISM PMI is no longer on FRED, so the Philly Fed factory survey stands in.
 - **Selection bias remains** whenever you click through many settings (and several targets). Judge settings by the final-test and randomization results, not by the one that looks best.
 - Educational only, not financial advice.
@@ -1937,9 +1967,9 @@ with T["reg"]:
         else:
             show_df(st, pd.DataFrame({"Transition": tr_df["Transition"], "Months": tr_df["Months"], f"Avg after {h}m": tr_df["Avg"].map(pc),
                                       "Median": tr_df["Median"].map(pc), "% positive": tr_df["Win"].map(lambda v: pc(v, False))}))
-    st.subheader("10 most similar historical environments (descriptive)")
+    st.subheader("10 most similar historical environments (descriptive, not tradable)")
     st.caption("Closest months by standardized distance across all selected indicators (at least h months apart). Closeness is relative to the typical distance in history. "
-               "This searches the whole available history, so it describes the past; it is NOT a backtest of the method (see the predictive test below).")
+               "This searches the whole available history, so it describes the past; it is NOT a backtest of the method and NOT a tradable signal (see the predictive test below).")
     show_df(st, pd.DataFrame({"Date": ana["Date"], "Closeness": ana["Closeness"].map(lambda v: f"{v:.0f}%"),
                               f"Outcome after {h}m": ana["After"].map(pc)}))
     ser_path = (m["silver"] / m["gold"]) if target == "gold" else m["silver"]
@@ -1953,10 +1983,10 @@ with T["reg"]:
                           xaxis_title="Months after", yaxis_title="%", height=400)
         show_plot(st, pf_)
 
-    st.subheader("Predictive test of the analogue method (expanding database)")
+    st.subheader("Predictive analogues (tradable signal, expanding database)")
     st.caption(f"For every {unseen_lbl} month the method looks for the {ANA_K} closest past months among months whose outcome was already known at that time "
                f"(standardised with that database only). Favorable = median outcome of the analogues is positive and at least 60% were positive; "
-               f"Unfavorable = median not positive and at most 40% positive. This is the fair version of the table above.")
+               f"Unfavorable = median not positive and at most 40% positive. This is the fair, tradable version of the descriptive table above, and it is available as a backtest signal.")
     if wa.empty:
         st.info("Not enough history for the predictive analogue test.")
     else:
@@ -2074,6 +2104,19 @@ with T["bt"]:
             crow.append({"Cost (bps per 100% traded)": b_, "CAGR": pc(pp["CAGR"]), "Sharpe": fm("Sharpe", pp["Sharpe"]), "Max drawdown": pc(pp["Max drawdown"])})
         show_df(st, pd.DataFrame(crow))
 
+        st.markdown(f"**Implementation check** (first signal, {grade_name.lower()})")
+        irow = []
+        for ik in ("ETF", "Futures"):
+            if ik == "ETF" and not (m["slv"].notna().sum() > 36 and m["gld"].notna().sum() > 36):
+                continue
+            rr, tt, WW = bt_one(m, pairs[0][1], aux, mode, bps, ik)
+            pp = perf(seg(rr, tt, WW, grade_bt)[0], rf_all)
+            irow.append({"Implementation": ik, "CAGR": pc(pp["CAGR"]), "Sharpe": fm("Sharpe", pp["Sharpe"]),
+                         "Max drawdown": pc(pp["Max drawdown"])})
+        show_df(st, pd.DataFrame(irow))
+        st.caption("If the two differ a lot, the result depends on tracking differences or roll gaps, not on the macro signal. "
+                   "(Months where ETF prices do not exist yet are excluded from the ETF row only through missing returns, so the two rows may cover slightly different months.)")
+
         if len(bt_all) >= 40:
             roll = go.Figure()
             for nm_, r_full in (("Strategy: " + first, ret0.reindex(bt_all).dropna()),
@@ -2184,9 +2227,67 @@ with T["rob"]:
                                       for k, v in fac_members.items()]))
             st.caption(f"Indicators were merged when their average |Spearman correlation| on the early learn period was at least {fac_thr:.2f}. "
                        "Each factor is the average of the members' z-scores (signs aligned to the lead indicator); 'factor high' means high in the lead indicator's direction. "
-                       "Indicators not listed here had no close relatives and stay as they are.")
+                       "Indicators not listed here had no close relatives and stay as they are. Equal weights are deliberate: learned weights would use outcomes.")
         else:
             st.info("No indicators were correlated enough to merge at this threshold. Lower the merge threshold in the sidebar.")
+
+    st.subheader("Ablations: does each add-on help out of sample?")
+    st.caption(f"Each variant refits the rules on the learn period and is graded on the {grade_name.lower()}. "
+               "These are diagnostics, not a menu to pick from: choosing the best row would be selection on the grading period. "
+               "Differences of a few points between rows are within noise for samples this short.")
+
+    def _P(Fx):
+        return pit_percentiles(Fx).reindex(F_ok.index) if pit else None
+
+    def _row(name, Fx, Px):
+        sp_a, nr = spread_for(Fx, Px, fwd, learn_idx, grade_idx, h, cfg)
+        return {"Variant": name, "Rules kept": nr,
+                f"{grade_name}: Fav − Unfav (pts)": "-" if pd.isna(sp_a) else f"{sp_a:+.1f}"}
+
+    abl = [_row("Current: factors on" if fac_mode else "Current: factors off", F_ok, P_ok)]
+    if fac_mode:
+        abl.append(_row("Factors off (raw indicators)", F_raw.loc[F_ok.index], _P(F_raw)))
+    for thr_a in (0.5, 0.6, 0.7, 0.8):
+        for al in (True, False):
+            Ff, _, _ = build_factors(F_raw, struct_idx, thr_a, al)
+            abl.append(_row(f"Factors, threshold {thr_a:.1f}, signs {'aligned' if al else 'not aligned'}",
+                            Ff.loc[F_ok.index], _P(Ff)))
+    if _key_ok and not fac_mode:
+        run_vint_abl = st.checkbox("Also run the vintage-data ablation (downloads the other data version once, then cached)", False, key="vint_abl")
+        if run_vint_abl:
+            try:
+                _, F_alt, P_alt, _, _ = get_dataset(get_fred_key(), not use_vintage)
+                Fa_ = F_alt.reindex(index=F_ok.index, columns=base_cols)
+                if Fa_.notna().all().all():
+                    abl.append(_row("Vintage data OFF (latest-revised)" if use_vintage else "Vintage data ON (first-release)",
+                                    Fa_, P_alt[base_cols].reindex(F_ok.index) if pit else None))
+                else:
+                    st.info("The other data version has gaps in the selected months, so the vintage ablation was skipped.")
+            except Exception:  # noqa: BLE001
+                st.info("Could not load the other data version, so the vintage ablation was skipped.")
+    show_df(st, pd.DataFrame(abl))
+
+    st.markdown("**Is the factor structure stable?** (merged pairs rebuilt on each half of the structure window)")
+    stab = []
+    for thr_a in (0.5, 0.6, 0.7, 0.8):
+        j_ = group_stability(F_raw, struct_idx, thr_a)
+        stab.append({"Merge threshold": f"{thr_a:.1f}", "Pair overlap between halves": "no merges" if pd.isna(j_) else f"{j_:.0%}"})
+    show_df(st, pd.DataFrame(stab))
+    st.caption("Overlap near 100% means the same indicators get merged in both halves of the structure window (stable). Low overlap means the factor structure depends on the sample.")
+
+    st.markdown("**Signal comparison (graded period)**")
+    srows = []
+    for nm_, ser_ in (("Rules (single fit)", verdict),
+                      ("Rules (expanding refit)", None if wfr.empty else wfr["v"]),
+                      ("Analogues (expanding, tradable)", None if wa.empty else ana_ver)):
+        if ser_ is None:
+            continue
+        ix_ = grade_idx.intersection(ser_.index)
+        t_ = summarize(fwd, ser_, ix_, h).set_index("Group")
+        ok_ = t_.loc[FAV, "Months"] >= 3 and t_.loc[UNF, "Months"] >= 3
+        srows.append({"Signal": nm_, "Fav months": int(t_.loc[FAV, "Months"]), "Unfav months": int(t_.loc[UNF, "Months"]),
+                      "Fav − Unfav (pts)": f"{(t_.loc[FAV, 'Avg'] - t_.loc[UNF, 'Avg']) * 100:+.1f}" if ok_ else "-"})
+    show_df(st, pd.DataFrame(srows))
 
     st.subheader("Parameter sensitivity")
     fr_grid = tuple(f for f in (0.4, 0.5, 0.6, 0.7) if f <= train_frac + val_frac + 1e-9) if REVEAL else tuple(f for f in (0.3, 0.4, 0.5, 0.6) if f <= train_frac + 1e-9)
@@ -2361,7 +2462,7 @@ with T["now"]:
         box.markdown(f"Rules: {ICON[r['rules']]} {r['rules']} (score {r['score']:+.1f})")
         if r["ml"]:
             box.markdown(f"ML: {r['ml']['p']:.0%} chance {NOW_PHRASE[k]} in {h}m (normal {r['ml']['base']:.0%}) → {ICON[r['ml']['verdict']]} {r['ml']['verdict']}")
-        box.markdown(f"Similar past periods: median {pc(r['ana_med'])}, {r['ana_pos']:.0%} positive")
+        box.markdown(f"Similar past periods (descriptive): median {pc(r['ana_med'])}, {r['ana_pos']:.0%} positive")
         box.markdown(f"Evidence on unseen data: **{r['ev_level']}**")
         box.caption(r["ev_text"])
         if r["ml"] and pd.notna(r["ml"]["auc"]):
