@@ -1,12 +1,19 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v4.4
+Silver Macro Environment Analyzer (Streamlit), v4.5
 
 Which macro environments have been historically favorable / unfavorable for silver (and gold), what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
 
-requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn
+requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn, scipy
 Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access (and for first-release / ALFRED data).
 Educational only, not financial advice.
+
+v4.5 changes:
+- NEW TAB "Projection": machine-learning projection of silver's future price ROUTE as a probability fan.
+  Quantile models (ridge + residual quantiles, gradient boosting with quantile loss, or their average) predict the 10 / 25 / 50 / 75 / 90% levels of silver's
+  forward return at 1-24 months; levels are shrunk toward the unconditional history by a trust slider; 1,000 sample routes match the predicted
+  distribution at every month. Graded walk-forward on unseen months against a history-only fan (pinball skill, coverage, rank IC, direction hit).
+  Projection settings are part of the final-test peek counter.
 
 v4.4 changes (third review):
 - ABLATIONS (Robustness tab). Factors on/off, factor merge threshold x sign alignment, and vintage data on/off, each refitted on the learn period
@@ -38,8 +45,9 @@ import requests
 import streamlit as st
 import yfinance as yf
 from pandas.tseries.holiday import USFederalHolidayCalendar
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from scipy.special import ndtri
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -82,6 +90,22 @@ VOL_TARGET = 0.30
 DD_FLOOR = 0.15  # "dd" / "ddb" targets: good when the forward max drawdown is shallower than this
 RULE_STEP = 6  # months between refits of the expanding-window rules
 ANA_K = 10  # analogues used per month in the predictive analogue test
+
+# --- projection tab constants
+PROJ_Q = (0.10, 0.25, 0.50, 0.75, 0.90)
+PROJ_GRID = (1, 2, 3, 4, 6, 9, 12, 18, 24)
+PROJ_LENGTHS = [6, 12, 18, 24]
+PROJ_STEP = 12        # months between refits in the walk-forward grading
+PROJ_ALPHA = 150.0    # ridge strength (strong on purpose: macro data is short and noisy)
+PROJ_MINTR = 48       # minimum training rows
+PROJ_PATHS = 1000     # simulated routes (even number: antithetic pairs)
+PROJ_DD = 0.15
+PJ_RIDGE, PJ_GBR, PJ_AVG = "Ridge + residual quantiles", "Gradient boosting (quantile)", "Average of both"
+PROJ_MODELS = [PJ_RIDGE, PJ_GBR, PJ_AVG]
+PROJ_FEATS = ["Macro + silver price momentum", "Macro indicators only", "Silver price momentum only"]
+PROJ_NAMES = {"px_mom1": "Silver, 1-month return", "px_mom3": "Silver, 3-month return", "px_mom6": "Silver, 6-month return",
+              "px_mom12": "Silver, 12-month return", "px_vol12": "Silver, 12-month volatility",
+              "px_trend": "Silver vs its 10-month average", "px_dd12": "Silver, drop from 12-month high"}
 
 STRATEGIES = [
     "Scaled: 100% / 50% / 0%",
@@ -1414,6 +1438,285 @@ def growth_chart(curves, common, title, mark=None):
     return f
 
 
+# ------------------------------------------------------------------ projection (ML route fan)
+def proj_rank_ic(a, b):
+    d = pd.concat([pd.Series(np.asarray(a, float)), pd.Series(np.asarray(b, float))], axis=1).dropna()
+    if len(d) < 8 or d.iloc[:, 0].nunique() < 2:
+        return np.nan
+    return d.iloc[:, 0].rank().corr(d.iloc[:, 1].rank())
+
+
+def pinball(y, Q, qs=PROJ_Q):
+    e = np.asarray(y)[:, None] - Q
+    qa = np.asarray(qs)
+    return float(np.maximum(qa * e, (qa - 1) * e).mean())
+
+
+def proj_price_features(m, idx):
+    s = m["silver"]
+    f = pd.DataFrame(index=m.index)
+    f["px_mom1"], f["px_mom3"] = s.pct_change(1), s.pct_change(3)
+    f["px_mom6"], f["px_mom12"] = s.pct_change(6), s.pct_change(12)
+    f["px_vol12"] = s.pct_change().rolling(12).std() * np.sqrt(12)
+    f["px_trend"] = s / s.rolling(10).mean() - 1
+    f["px_dd12"] = s / s.rolling(12).max() - 1
+    return f.reindex(idx)
+
+
+def proj_inputs(m, F_ok, feats, length):
+    """Features known at each month-end and forward log returns for every grid horizon up to `length`."""
+    pf = proj_price_features(m, F_ok.index)
+    X = F_ok if feats == PROJ_FEATS[1] else (pf if feats == PROJ_FEATS[2] else pd.concat([F_ok, pf], axis=1))
+    X = X.replace([np.inf, -np.inf], np.nan).dropna()
+    ks = [k for k in PROJ_GRID if k <= length]
+    s = m["silver"]
+    Y = pd.DataFrame({k: np.log(s.shift(-k) / s) for k in ks}).reindex(X.index)
+    return X, Y, ks
+
+
+def _fit_quantiles(model_name, Xtr, ytr, qs, Xte):
+    """Predicted quantiles (rows = Xte, columns = qs)."""
+    if model_name == PJ_RIDGE:
+        mdl = make_pipeline(StandardScaler(), Ridge(alpha=PROJ_ALPHA)).fit(Xtr, ytr)
+        rq = np.quantile(ytr - mdl.predict(Xtr), qs)
+        return mdl.predict(Xte)[:, None] + rq[None, :]
+    cols = [GradientBoostingRegressor(loss="quantile", alpha=q, n_estimators=40, max_depth=2, learning_rate=0.05, subsample=0.8,
+                                      min_samples_leaf=10, random_state=0).fit(Xtr, ytr).predict(Xte) for q in qs]
+    return np.sort(np.column_stack(cols), axis=1)
+
+
+@st.cache_data(show_spinner=False)
+def proj_walk_forward(X, Y, qs, cut, end, step, model_name):
+    """Every `step` months refit using only rows whose k-month outcome was already known, predict the next `step` months.
+    Returns {k: (dates, model quantiles, history-only quantiles, realised log return)}. No Streamlit calls inside."""
+    Xv, idx, out = X.values.astype(float), X.index, {}
+    for k in Y.columns:
+        yv = Y[k].values.astype(float)
+        dts, M, B, yy = [], [], [], []
+        for s0 in range(cut, end, step):
+            te = np.arange(s0, min(s0 + step, end))
+            tr = np.arange(0, max(s0 - int(k) + 1, 0))
+            tr = tr[~np.isnan(yv[tr])]
+            if len(tr) < PROJ_MINTR or len(te) == 0:
+                continue
+            M.append(_fit_quantiles(model_name, Xv[tr], yv[tr], qs, Xv[te]))
+            B.append(np.tile(np.quantile(yv[tr], qs), (len(te), 1)))
+            dts.extend(idx[te])
+            yy.extend(yv[te])
+        if M:
+            out[int(k)] = (pd.DatetimeIndex(dts), np.vstack(M), np.vstack(B), np.array(yy, float))
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def proj_fit_today(X, Y, qs, model_name):
+    """Fit on every row whose outcome is known and predict from the latest month. Returns (horizons, model quantiles, history quantiles)."""
+    Xv = X.values.astype(float)
+    ks, Qm, Qb = [], [], []
+    for k in Y.columns:
+        yv = Y[k].values.astype(float)
+        tr = np.where(~np.isnan(yv))[0]
+        if len(tr) < PROJ_MINTR:
+            continue
+        Qm.append(_fit_quantiles(model_name, Xv[tr], yv[tr], qs, Xv[-1:])[0])
+        Qb.append(np.quantile(yv[tr], qs))
+        ks.append(int(k))
+    return ks, np.array(Qm), np.array(Qb)
+
+
+def _proj_members(model_name):
+    return [PJ_RIDGE, PJ_GBR] if model_name == PJ_AVG else [model_name]
+
+
+def _combine_wf(parts):
+    if len(parts) == 1:
+        return parts[0]
+    out = {}
+    for k in parts[0]:
+        if all(k in p for p in parts):
+            idx, _, B, y = parts[0][k]
+            out[k] = (idx, np.mean([p[k][1] for p in parts], axis=0), B, y)
+    return out
+
+
+def to_curve(ks, Q, L):
+    """Interpolate per-horizon quantiles to every month 0..L (0 at month 0)."""
+    mo = np.arange(0, L + 1)
+    return np.column_stack([np.interp(mo, [0] + list(ks), [0.0] + list(Q[:, j])) for j in range(Q.shape[1])])
+
+
+def proj_paths(Qc, qs, S0, n=PROJ_PATHS, seed=7):
+    """Routes whose month-j value follows the predicted quantiles of month j exactly. A standardised random walk (W_j / sqrt(j) ~ N(0,1))
+    supplies the month-to-month dependence; each month's z-score is mapped through that month's quantile curve (linear tails)."""
+    L = Qc.shape[0] - 1
+    zq = ndtri(np.asarray(qs))
+    rng = np.random.default_rng(seed)
+    e = rng.standard_normal((n // 2, L))
+    e = np.vstack([e, -e])  # antithetic pairs
+    Z = np.cumsum(e, axis=1) / np.sqrt(np.arange(1, L + 1))
+    lr = np.zeros((len(e), L + 1))
+    for j in range(1, L + 1):
+        v = np.maximum.accumulate(Qc[j])
+        slo = max((v[1] - v[0]) / (zq[1] - zq[0]), 1e-6)
+        shi = max((v[-1] - v[-2]) / (zq[-1] - zq[-2]), 1e-6)
+        z = Z[:, j - 1]
+        y = np.interp(z, zq, v)
+        y = np.where(z < zq[0], v[0] + slo * (z - zq[0]), y)
+        y = np.where(z > zq[-1], v[-1] + shi * (z - zq[-1]), y)
+        lr[:, j] = y
+    return S0 * np.exp(lr)
+
+
+def proj_score(wfd, lam, eval_idx, ks):
+    """Walk-forward grade on unseen months: model fan (shrunk by lam toward history) versus the history-only fan."""
+    rows, mid = [], len(PROJ_Q) // 2
+    for k in ks:
+        if k not in wfd:
+            continue
+        idx, M, B, y = wfd[k]
+        ok = np.asarray(idx.isin(eval_idx)) & ~np.isnan(y)
+        if ok.sum() < 8:
+            continue
+        Qb = B[ok]
+        Qm = np.sort(Qb + lam * (M[ok] - Qb), axis=1)
+        yy = y[ok]
+        pm, pb = pinball(yy, Qm), pinball(yy, Qb)
+        call, real = np.sign(Qm[:, mid] - Qb[:, mid]), np.sign(yy - Qb[:, mid])
+        nz = call != 0
+        rows.append(dict(k=k, n=int(ok.sum()), ic=proj_rank_ic(Qm[:, mid], yy),
+                         hit=float((call[nz] == real[nz]).mean()) if nz.any() else np.nan,
+                         skill=1 - pm / pb if pb > 0 else np.nan,
+                         c80=float(((yy >= Qm[:, 0]) & (yy <= Qm[:, -1])).mean()),
+                         c50=float(((yy >= Qm[:, 1]) & (yy <= Qm[:, -2])).mean())))
+    return pd.DataFrame(rows)
+
+
+def render_projection_tab(m, F_ok, val_idx, unseen_idx, unseen_lbl, reveal, model_name, feats, length, trust, label):
+    """label(col) -> display name of a feature column."""
+    lam = trust / 100.0
+    st.subheader(f"🔮 Silver price projection: the next {length} months")
+    st.caption("A machine-learning FAN of possible routes, not a single forecast line. Each month's spread is the model's predicted distribution of silver's return "
+               "(10 / 25 / 50 / 75 / 90% levels), shrunk toward the unconditional history by the trust setting; sample routes move like a random walk but "
+               "match that distribution at every month. The grading table below checks, on months the model never saw, whether it beats a history-only fan. "
+               "Today's fit uses every outcome known so far (like the other 'now' reads); grading uses only unseen months.")
+
+    X, Y, ks_all = proj_inputs(m, F_ok, feats, length)
+    if len(X) < 120 or not ks_all:
+        st.info("Not enough history for the projection with these settings. Move the start date earlier or use more indicators.")
+        return
+    members = _proj_members(model_name)
+    cut = int(X.index.searchsorted(val_idx[0]))
+    end = len(X) if reveal else int(X.index.searchsorted(val_idx[-1], side="right"))
+    with st.spinner("Fitting projection models (cached after the first run)..."):
+        wf = _combine_wf([proj_walk_forward(X, Y, PROJ_Q, cut, end, PROJ_STEP, nm) for nm in members])
+        fits = [proj_fit_today(X, Y, PROJ_Q, nm) for nm in members]
+    ks, Qm, Qb = fits[0][0], np.mean([f[1] for f in fits], axis=0), fits[0][2]
+    if not ks:
+        st.info("Not enough training rows to fit any horizon.")
+        return
+    L = min(length, max(ks))
+    Qs = np.sort(Qb + lam * (Qm - Qb), axis=1)
+    Qc, Qbc = to_curve(ks, Qs, L), to_curve(ks, Qb, L)
+    S0 = float(m["silver"].loc[X.index[-1]])
+    P = proj_paths(Qc, PROJ_Q, S0)
+    fut = pd.DatetimeIndex([X.index[-1] + pd.offsets.MonthEnd(j) for j in range(L + 1)])
+    mid = len(PROJ_Q) // 2
+
+    # --- headline numbers
+    run_max = np.maximum.accumulate(P, axis=1)
+    mdd = (P / run_max - 1).min(axis=1)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"Median price in {L}m", f"${S0 * np.exp(Qc[L, mid]):,.1f}", f"{np.exp(Qc[L, mid]) - 1:+.1%} vs ${S0:,.1f} now")
+    c2.metric(f"80% range in {L}m", f"${S0 * np.exp(Qc[L, 0]):,.0f} – ${S0 * np.exp(Qc[L, -1]):,.0f}")
+    c3.metric(f"Chance higher in {L}m", f"{(P[:, L] > S0).mean():.0%}")
+    c4.metric(f"Chance of a {PROJ_DD:.0%}+ drawdown on the way", f"{(mdd <= -PROJ_DD).mean():.0%}",
+              f"typical worst fall {np.median(mdd):.0%}", delta_color="off")
+
+    # --- fan chart
+    hist = m["silver"].loc[: X.index[-1]].iloc[-60:]
+    f = go.Figure()
+    f.add_scatter(x=hist.index, y=hist.values, name="Silver (history)", line=dict(color="#555"))
+
+    def band(lo, hi, color, name):
+        f.add_scatter(x=list(fut) + list(fut[::-1]), y=list(S0 * np.exp(Qc[:, hi])) + list(S0 * np.exp(Qc[::-1, lo])),
+                      fill="toself", fillcolor=color, line=dict(width=0), name=name, hoverinfo="skip")
+
+    band(0, len(PROJ_Q) - 1, "rgba(74,111,165,0.15)", "10–90% range")
+    band(1, len(PROJ_Q) - 2, "rgba(74,111,165,0.30)", "25–75% range")
+    for i in range(25):
+        f.add_scatter(x=fut, y=P[i], line=dict(width=1, color="rgba(70,110,170,0.22)"), showlegend=False, hoverinfo="skip")
+    f.add_scatter(x=fut, y=S0 * np.exp(Qbc[:, mid]), name="History-only median", line=dict(color="#999", dash="dash", width=2))
+    f.add_scatter(x=fut, y=S0 * np.exp(Qc[:, mid]), name="ML median route", line=dict(color="#1f5fbf", width=3))
+    vmark(f, fut[0], "today")
+    f.update_layout(title=f"Silver route fan: {model_name}, trust {trust}%", yaxis_title="USD / oz", height=500)
+    show_plot(st, f)
+    st.caption("Shaded bands are the model's predicted distribution at each month; the thin lines are 25 of 1,000 sample routes; "
+               "the dashed grey line is what plain history alone would say. The gap between the blue and grey medians is everything the model adds.")
+
+    # --- table by horizon
+    rows = []
+    for k in sorted({k for k in (1, 3, 6, 12, 18, 24) if k <= L} | {L}):
+        rows.append({"Horizon": f"{k} months", "Median price": f"${S0 * np.exp(Qc[k, mid]):,.1f}",
+                     "Median change": pc(np.exp(Qc[k, mid]) - 1), "History-only median": pc(np.exp(Qbc[k, mid]) - 1),
+                     "25–75% range": f"{np.exp(Qc[k, 1]) - 1:+.0%} to {np.exp(Qc[k, -2]) - 1:+.0%}",
+                     "10–90% range": f"{np.exp(Qc[k, 0]) - 1:+.0%} to {np.exp(Qc[k, -1]) - 1:+.0%}",
+                     "Chance higher": f"{(P[:, k] > S0).mean():.0%}"})
+    show_df(st, pd.DataFrame(rows))
+
+    # --- grading
+    st.subheader("Does the model beat plain history? (walk-forward, unseen months only)")
+    ev_ = pd.DatetimeIndex(unseen_idx)
+    sc = proj_score(wf, lam, ev_, ks)
+    st.caption(f"Graded on {unseen_lbl} months. Each refit uses only rows whose outcome was already known. "
+               "**Skill** = reduction in pinball loss (the quantile-forecast error) versus the history-only fan: positive means the model's fan was better. "
+               "**Coverage** should be near its nominal level (80% / 50%). **Rank IC** = rank correlation of the model's median with the realised return. "
+               "**Direction hit** = how often the model's tilt above / below the history median matched the outcome (50% = coin flip). "
+               "Windows overlap, so the number of independent observations is roughly months ÷ horizon.")
+    if sc.empty:
+        st.info("Not enough unseen months to grade the projection.")
+    else:
+        show_df(st, pd.DataFrame({
+            "Horizon": [f"{k} months" for k in sc["k"]], "Unseen months": sc["n"],
+            "Skill vs history": sc["skill"].map(lambda v: pc(v)), "Rank IC": sc["ic"].map(lambda v: "-" if pd.isna(v) else f"{v:+.2f}"),
+            "Direction hit": sc["hit"].map(lambda v: pc(v, False)),
+            "80% range coverage": sc["c80"].map(lambda v: pc(v, False)), "50% range coverage": sc["c50"].map(lambda v: pc(v, False))}))
+        good_ = (sc["skill"] > 0) & (sc["ic"] > 0)
+        share, avg = float(good_.mean()), float(sc["skill"].mean())
+        cov = float(sc["c80"].mean())
+        if share >= 0.7 and avg > 0.02:
+            st.success(f"The model beat history-only on {good_.sum()} of {len(sc)} horizons (average skill {avg:+.1%}). Some real information, but the test is short "
+                       "and windows overlap: read the median tilt as a mild lean, not a target.")
+        else:
+            st.warning(f"The model did NOT reliably beat history-only ({good_.sum()} of {len(sc)} horizons better, average skill {avg:+.1%}). "
+                       "Treat the fan as a risk range (how wide routes can be) and ignore any tilt in the median. Lowering the trust setting moves the fan toward history.")
+        if cov < 0.70 or cov > 0.90:
+            st.warning(f"The 80% range contained the outcome {cov:.0%} of the time on unseen months, so the fan is {'too narrow' if cov < 0.70 else 'too wide'}.")
+
+        tr_rows = []
+        for l_ in (0.0, 0.25, 0.5, 0.75, 1.0):
+            s_ = proj_score(wf, l_, ev_, ks)
+            if not s_.empty:
+                tr_rows.append({"Trust in model": f"{l_:.0%}", "Average skill vs history": pc(s_["skill"].mean()),
+                                "Average rank IC": "-" if s_["ic"].isna().all() else f"{s_['ic'].mean():+.2f}",
+                                "Average 80% coverage": pc(s_["c80"].mean(), False)})
+        st.markdown("**Skill by trust level** (a diagnostic, not a menu: choosing the best row would select on the grading months)")
+        show_df(st, pd.DataFrame(tr_rows))
+
+    # --- drivers
+    kd = min(ks, key=lambda k: abs(k - 6))
+    ok_ = Y[kd].notna().values
+    mdl = make_pipeline(StandardScaler(), Ridge(alpha=PROJ_ALPHA)).fit(X.values[ok_], Y[kd].values[ok_])
+    scl, rg = mdl[0], mdl[-1]
+    contrib = pd.Series(rg.coef_ * (X.iloc[-1].values - scl.mean_) / scl.scale_, index=X.columns) * 100
+    contrib = contrib.reindex(contrib.abs().sort_values(ascending=False).index).head(12)
+    st.subheader(f"What is pushing the {kd}-month projection today?")
+    st.bar_chart(contrib.rename(index={c: label(c) for c in contrib.index}).sort_values())
+    st.caption(f"Contribution of each feature to the {kd}-month expected log return, in percentage points relative to an average month (ridge view, shown for every model). "
+               "Correlated indicators share credit unpredictably, so read this as a story about the inputs, not as causes.")
+    st.warning("**Not a price target and not financial advice.** The fan describes how wide silver's routes have been after similar conditions, "
+               "adjusted by a model that may have no skill. Shocks, news and regime changes are not in the data.")
+
+
 # ================================================================== UI
 with st.sidebar:
     st.header("Settings")
@@ -1478,6 +1781,14 @@ with st.sidebar:
     find_best = st.checkbox("🏁 Find the best strategy", False, disabled=LK,
                             help="Ranks every strategy on every signal using the VALIDATION period, then grades the winner on the untouched final test.")
     rank_by = st.selectbox("Rank strategies by", RANK_METRICS, disabled=(not find_best) or LK)
+    st.subheader("Projection")
+    proj_model = st.selectbox("Projection model", PROJ_MODELS, disabled=LK,
+                              help="Ridge is fast. Gradient boosting (and the average of both) takes a while on the first run, then it is cached.")
+    proj_feats = st.selectbox("Projection features", PROJ_FEATS, disabled=LK,
+                              help="Silver's own momentum, volatility and trend can be added to the macro indicators, or used alone.")
+    proj_len = st.select_slider("Projection length (months)", options=PROJ_LENGTHS, value=12, disabled=LK)
+    proj_trust = st.slider("Trust in the model (0% = history only)", 0, 100, 50, 10, disabled=LK,
+                           help="Shrinks the model's fan toward the unconditional historical distribution of silver's returns.")
 
 st.title("🥈 Silver Macro Environment Analyzer")
 st.caption("Historically favorable or unfavorable macro environments for silver and gold. Not a buy/sell signal, not financial advice.")
@@ -1587,7 +1898,8 @@ if len(learn_idx) < 36 or len(val_idx) < 8 or len(test_idx) < 12:
 peek = None
 if REVEAL:
     peek = register_peek(repr((start, target, h, auto_h, sorted(base_cols), fac_mode, fac_thr, use_vintage, train_frac, val_frac, pit, cfg,
-                               run_ml, ml_choice, margin, step, mode, impl_key, bps, find_best, rank_by)))
+                               run_ml, ml_choice, margin, step, mode, impl_key, bps, find_best, rank_by,
+                               proj_model, proj_feats, proj_len, proj_trust)))
 
 S, stats, good, bad, score, verdict = run_rules(F_ok, P_ok, fwd, learn_idx, h, cfg)
 wfr = walk_forward_rules(F_ok, P_ok, fwd, h, sp["cut"], RULE_STEP, cfg)
@@ -1640,7 +1952,7 @@ else:
 
 tabs_def = [("dash", "📊 Dashboard"), ("guide", "📖 Guide"), ("env", "🗺 Environments"), ("rank", "🏆 Indicator ranking"),
             ("test", "🧪 Out-of-sample"), ("reg", "🧭 Regimes & analogues"), ("bt", "💰 Backtest"), ("rob", "🛡 Robustness"),
-            ("exp", "🔎 Explorer")]
+            ("exp", "🔎 Explorer"), ("proj", "🔮 Projection")]
 if run_ml:
     tabs_def.append(("ml", "🤖 Machine learning"))
 if auto_h:
@@ -1744,6 +2056,8 @@ with T["guide"]:
   runs a **randomization test** (signal shifted in time) so you can see how often luck would have done as well, and shows an **implementation check** (ETF vs futures side by side).
 - **Robustness:** multiple-testing summary, factor composition and stability, **ablations** (factors, merge threshold, sign alignment, vintage data), signal comparison, parameter-sensitivity grid, rolling indicator strength, indicator redundancy.
   The ablations are diagnostics, not a menu: picking the best row would be selection on the grading period.
+- **Projection:** a machine-learning **fan of possible silver price routes** for the next 6-24 months. Quantile models (ridge + residual quantiles, gradient boosting, or both) predict the 10 / 25 / 50 / 75 / 90% levels of silver's forward return from the macro indicators and, optionally, silver's own momentum;
+  the trust slider shrinks them toward plain history. Sample routes match the predicted distribution at every month. The tab grades the model walk-forward on unseen months against a history-only fan and says plainly when it adds nothing.
 - **Silver & gold now:** separate reads for silver, gold and silver-versus-gold, with a confidence level that combines how many evidence channels agree and whether the rules worked on unseen data.
 
 ### Supply, demand and positioning (optional pillar)
@@ -2360,6 +2674,11 @@ with T["exp"]:
     show_df(st, pd.DataFrame(rows))
     with st.expander("List the months"):
         st.write(", ".join(d.strftime("%b %Y") for d in sel_idx))
+
+# ------------------------------------------------------------------ projection
+with T["proj"]:
+    render_projection_tab(m, F_ok, val_idx, unseen_idx, unseen_lbl, REVEAL, proj_model, proj_feats, proj_len, proj_trust,
+                          lambda c: META_ALL[c][0] if c in META_ALL else PROJ_NAMES.get(c, c))
 
 # ------------------------------------------------------------------ machine learning
 if run_ml:
