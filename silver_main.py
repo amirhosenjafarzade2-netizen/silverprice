@@ -14,7 +14,7 @@ Files:
   silver_tabs_overview.py        Dashboard, Guide, Environments, Indicator ranking, Out-of-sample
   silver_tabs_analysis.py        Regimes & analogues, Backtest, Robustness, Explorer
   silver_tabs_expectations.py    Expectations tab (market / macro expectation indicators, grading, link to silver)
-  silver_tabs_projection.py      Projection, Machine learning, Look-ahead scan, Silver & gold now
+  silver_tabs_projection.py      Projection, Machine learning, Look-ahead scan, Silver & gold now, Report (Word file of all tabs)
   silver_expectations.py         expectation-indicator engine (imported by this file)
 
 v4.6 changes:
@@ -1722,6 +1722,7 @@ if run_ml:
 if auto_h:
     tabs_def.append(("scan", "🔍 Look-ahead scan"))
 tabs_def.append(("now", "✅ Silver & gold now"))
+tabs_def.append(("report", "📄 Report (Word)"))
 T = dict(zip([k for k, _ in tabs_def], st.tabs([n for _, n in tabs_def])))
 
 # ------------------------------------------------------------------ tab modules
