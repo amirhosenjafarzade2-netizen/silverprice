@@ -1,5 +1,5 @@
 """
-Silver Macro Environment Analyzer (Streamlit), v4.6
+Silver Macro Environment Analyzer (Streamlit), v4.5
 
 Which macro environments have been historically favorable / unfavorable for silver (and gold), what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
@@ -14,13 +14,6 @@ Files:
   silver_tabs_overview.py        Dashboard, Guide, Environments, Indicator ranking, Out-of-sample
   silver_tabs_analysis.py        Regimes & analogues, Backtest, Robustness, Explorer
   silver_tabs_projection.py      Projection, Machine learning, Look-ahead scan, Silver & gold now
-
-v4.6 changes:
-- NEW PILLAR "Expectations": 13 market-implied indicators built from free FRED series (policy-path gaps from the 1y / 2y / 6-month yields versus fed funds,
-  revisions of the 2y yield, 5y5y forward breakeven, Cleveland Fed expected inflation, Michigan survey, expected real short rate, 10y-3m curve).
-  Five of them are on by default; the rest are optional.
-- The ML projection can use expectations explicitly (two new feature sets) and grades "with versus without expectations" on the same unseen months.
-- Dashboard: "What the market expects now" panel.
 
 v4.5 changes:
 - NEW TAB "Projection": machine-learning projection of silver's future price ROUTE as a probability fan.
@@ -75,17 +68,12 @@ SGN = {FAV: 1, NEU: 0, UNF: -1}
 VICON = {1: "🟢", 0: "⚪", -1: "🔴"}
 FRED = {"real_yield": "DFII10", "breakeven": "T10YIE", "fed_funds": "DFF", "curve": "T10Y2Y",
         "m2": "M2SL", "cpi": "CPIAUCSL", "indpro": "INDPRO", "nfci": "NFCI",
-        "credit": "BAA10Y", "unrate": "UNRATE", "philly": "GACDFSA066MSFRBPHI",
-        # expectations pillar (market prices and model outputs; no hard-to-get consensus data)
-        "dgs2": "DGS2", "dgs1": "DGS1", "dgs6m": "DGS6MO", "fwd5y5y": "T5YIFR", "curve3m": "T10Y3M",
-        "expinf1": "EXPINF1YR", "expinf10": "EXPINF10YR", "mich": "MICH"}
+        "credit": "BAA10Y", "unrate": "UNRATE", "philly": "GACDFSA066MSFRBPHI"}
 # Series that get revised and therefore can use first-release (ALFRED) values when a FRED key is present.
 VINT_KEYS = ("m2", "cpi", "indpro", "unrate", "philly", "nfci")
 # Monthly series are only usable after publication: (months, days) added to the observation date.
 # With 'First-release (ALFRED) data' on (needs a FRED key) the real release date is used when it looks sane; otherwise these approximate lags apply.
-# expinf1 / expinf10 (Cleveland Fed model) and mich (Michigan survey) use conservative lags and latest-revised values (small revisions).
-PUB_LAG = {"m2": (1, 20), "cpi": (1, 20), "indpro": (1, 20), "unrate": (1, 10), "philly": (0, 21), "nfci": (0, 7),
-           "expinf1": (1, 20), "expinf10": (1, 20), "mich": (1, 5)}
+PUB_LAG = {"m2": (1, 20), "cpi": (1, 20), "indpro": (1, 20), "unrate": (1, 10), "philly": (0, 21), "nfci": (0, 7)}
 YF = {"silver": "SI=F", "gold": "GC=F", "dollar": "DX-Y.NYB", "oil": "CL=F", "copper": "HG=F",
       "vix": "^VIX", "spx": "^GSPC", "tnx": "^TNX", "irx": "^IRX", "pl": "PL=F", "slv": "SLV", "gld": "GLD",
       "sil": "SIL", "tan": "TAN"}
@@ -103,9 +91,8 @@ TARGETS = {"Silver's return": "ret",
            "Silver minus gold (relative)": "gold",
            "Silver minus cash (T-bills)": "cash"}
 RISK_TARGETS = ("vol", "dd", "ddb")
-PILLARS = ["Monetary", "Dollar", "Industrial & growth", "Liquidity & risk", "Gold & valuation", "Supply, demand & positioning", "Expectations"]
+PILLARS = ["Monetary", "Dollar", "Industrial & growth", "Liquidity & risk", "Gold & valuation", "Supply, demand & positioning"]
 SDP = "Supply, demand & positioning"
-EXPC = "Expectations"
 STATES = ["Low", "Mid", "High"]
 VOL_TARGET = 0.30
 DD_FLOOR = 0.15  # "dd" / "ddb" targets: good when the forward max drawdown is shallower than this
@@ -123,9 +110,7 @@ PROJ_PATHS = 1000     # simulated routes (even number: antithetic pairs)
 PROJ_DD = 0.15
 PJ_RIDGE, PJ_GBR, PJ_AVG = "Ridge + residual quantiles", "Gradient boosting (quantile)", "Average of both"
 PROJ_MODELS = [PJ_RIDGE, PJ_GBR, PJ_AVG]
-# NOTE: the first three entries keep their positions (the projection code indexes them); the expectation options are appended.
-PROJ_FEATS = ["Macro + silver price momentum", "Macro indicators only", "Silver price momentum only",
-              "Macro + expectations + silver price momentum", "Expectations + silver price momentum"]
+PROJ_FEATS = ["Macro + silver price momentum", "Macro indicators only", "Silver price momentum only"]
 PROJ_NAMES = {"px_mom1": "Silver, 1-month return", "px_mom3": "Silver, 3-month return", "px_mom6": "Silver, 6-month return",
               "px_mom12": "Silver, 12-month return", "px_vol12": "Silver, 12-month volatility",
               "px_trend": "Silver vs its 10-month average", "px_dd12": "Silver, drop from 12-month high"}
@@ -187,34 +172,16 @@ META_ALL = {
     "cot_net":        ("Speculative positioning (CFTC managed-money net, % of open interest)", "Light speculative positioning", "Crowded speculative longs", False, SDP),
     "miners_rel":     ("Silver miners (SIL) vs silver, 3-month relative", "Miners lagging silver", "Miners outperforming silver", True, SDP),
     "solar_mom":      ("Solar stocks (TAN), 3-month trend (industrial-demand proxy)", "Solar stocks falling", "Solar stocks rising", True, SDP),
-    # --- expectations pillar (market-implied or model-implied; the direction for silver is learned, never hard-coded)
-    "exp_gap2":       ("Policy-path gap: 2y Treasury minus Fed funds", "Cuts priced in (2y below policy rate)", "Hikes priced in (2y above policy rate)", False, EXPC),
-    "exp_gap1":       ("Policy-path gap: 1y Treasury minus Fed funds", "Cuts priced in (1y below policy rate)", "Hikes priced in (1y above policy rate)", False, EXPC),
-    "exp_gap6m":      ("Policy-path gap: 6-month bill minus Fed funds", "Near-term cuts priced in", "Near-term hikes priced in", False, EXPC),
-    "exp_rev1":       ("Rate-expectation revision: 2y yield, 1-month change", "Rate expectations falling", "Rate expectations rising", False, EXPC),
-    "exp_rev3":       ("Rate-expectation revision: 2y yield, 3-month change", "Rate expectations falling", "Rate expectations rising", False, EXPC),
-    "fwd_infl":       ("Long-run inflation expectations (5y5y forward breakeven)", "Low long-run inflation expectations", "High long-run inflation expectations", False, EXPC),
-    "fwd_infl_chg":   ("5y5y forward breakeven, 3-month change", "Long-run inflation expectations falling", "Long-run inflation expectations rising", False, EXPC),
-    "expinf1":        ("Expected inflation, next 1 year (Cleveland Fed model)", "Low 1y expected inflation", "High 1y expected inflation", False, EXPC),
-    "expinf10":       ("Expected inflation, next 10 years (Cleveland Fed model)", "Low 10y expected inflation", "High 10y expected inflation", False, EXPC),
-    "infl_gap":       ("Expected 1y inflation minus current CPI inflation", "Inflation expected to fall", "Inflation expected to rise", False, EXPC),
-    "exp_real1":      ("Expected real short rate (1y Treasury minus expected 1y inflation)", "Low expected real short rate", "High expected real short rate", False, EXPC),
-    "mich":           ("Consumer inflation expectations, 1y (Michigan survey)", "Low consumer inflation expectations", "High consumer inflation expectations", False, EXPC),
-    "curve3m":        ("Curve: 10y minus 3-month (recession-risk proxy)", "Inverted curve (recession risk priced)", "Steep curve (growth priced)", False, EXPC),
 }
-# All expectation indicators, and the small default subset (the rest are optional: more indicators means more chances for a fluke)
-EXP_KEYS = ["exp_gap2", "exp_gap1", "exp_gap6m", "exp_rev1", "exp_rev3", "fwd_infl", "fwd_infl_chg", "expinf1", "expinf10",
-            "infl_gap", "exp_real1", "mich", "curve3m"]
-EXP_CORE = ["exp_gap2", "exp_rev3", "fwd_infl", "infl_gap", "exp_real1"]
 CORE = ["real_yield", "real_yield_chg", "breakeven", "fed_chg", "curve", "dollar_mom", "oil_mom", "copper_mom",
-        "vix", "spx_mom", "gs_ratio", "m2_yoy", "nfci", "sg_mom", "val_real", "credit", "sahm", "philly"] + EXP_CORE
+        "vix", "spx_mom", "gs_ratio", "m2_yoy", "nfci", "sg_mom", "val_real", "credit", "sahm", "philly"]
 META = dict(META_ALL)  # narrowed to indicators in use once data loads (factor entries are added to META_ALL at run time)
 # (indicator, sign): growth is NOT measured with stocks any more (stocks are risk appetite, not growth)
 GROWTH = [("copper_mom", 1), ("indpro_yoy", 1), ("philly", 1), ("sahm", -1)]
 INFL = [("cpi_yoy", 1), ("breakeven", 1), ("oil_mom", 1)]
 REGIMES = ["Goldilocks (growth↑ inflation↓)", "Reflation (growth↑ inflation↑)",
            "Stagflation (growth↓ inflation↑)", "Slowdown / deflation (growth↓ inflation↓)"]
-MONETARY_PILLARS, INDUSTRIAL_PILLARS = ["Monetary", "Dollar", "Gold & valuation", "Expectations"], ["Industrial & growth"]
+MONETARY_PILLARS, INDUSTRIAL_PILLARS = ["Monetary", "Dollar", "Gold & valuation"], ["Industrial & growth"]
 
 
 def show_df(box, d):
@@ -404,9 +371,6 @@ def _prepare_monthly(px, fr, failed, rel=None):
         fr["philly"] = _avail(fr["philly"], "philly", rel).dropna()
     if "nfci" in fr:  # weekly, published with a short delay; first-release values when available
         fr["nfci"] = _avail(fr["nfci"], "nfci", rel).dropna()
-    for k in ("expinf1", "expinf10", "mich"):  # monthly expectation series: only usable after publication (conservative lags)
-        if k in fr:
-            fr[k] = _avail(fr[k], k, rel).dropna()
     daily = px.join(pd.concat(fr, axis=1), how="outer") if fr else px
     daily = daily.sort_index().ffill().dropna(subset=["silver"])
     return month_end(daily).dropna(subset=["silver"]), sorted(set(failed))
@@ -522,23 +486,6 @@ def build_features(m):
     F["cot_net"] = g("cot")
     F["miners_rel"] = (g("sil") / g("silver")).pct_change(3)
     F["solar_mom"] = g("tan").pct_change(3)
-    # --- expectations pillar. Market prices (Treasury yields, breakevens) are not revised, so they are naturally point-in-time.
-    # The policy-path gap (a Treasury yield minus the current policy rate) is the standard free proxy for priced-in cuts / hikes;
-    # a change in the 2y yield is the proxy for a REVISION of that path.
-    ff = g("fed_funds")
-    F["exp_gap2"] = g("dgs2") - ff
-    F["exp_gap1"] = g("dgs1") - ff
-    F["exp_gap6m"] = g("dgs6m") - ff
-    F["exp_rev1"] = g("dgs2").diff(1)
-    F["exp_rev3"] = g("dgs2").diff(3)
-    F["fwd_infl"] = g("fwd5y5y")
-    F["fwd_infl_chg"] = g("fwd5y5y").diff(3)
-    F["expinf1"] = g("expinf1")
-    F["expinf10"] = g("expinf10")
-    F["infl_gap"] = g("expinf1") - g("cpi_yoy")
-    F["exp_real1"] = g("dgs1") - g("expinf1")
-    F["mich"] = g("mich")
-    F["curve3m"] = g("curve3m")
     keep = [c for c in META_ALL if c in F and F[c].notna().any()]
     if "real_yield" in keep:
         keep = [c for c in keep if not c.startswith("nom_")]
@@ -1566,11 +1513,8 @@ with st.sidebar:
     st.subheader("Projection")
     proj_model = st.selectbox("Projection model", PROJ_MODELS, disabled=LK,
                               help="Ridge is fast. Gradient boosting (and the average of both) takes a while on the first run, then it is cached.")
-    proj_feats = st.selectbox("Projection features", PROJ_FEATS, index=3, disabled=LK,
-                              help="Silver's own momentum, volatility and trend can be added to the macro indicators, or used alone. "
-                                   "The two expectation options force ALL expectation indicators (policy-path gaps, rate-expectation revisions, forward inflation, "
-                                   "expected real rate, curve) into the model, even if they are not ticked in the indicator list. "
-                                   "The Projection tab grades 'with versus without expectations' on the same unseen months.")
+    proj_feats = st.selectbox("Projection features", PROJ_FEATS, disabled=LK,
+                              help="Silver's own momentum, volatility and trend can be added to the macro indicators, or used alone.")
     proj_len = st.select_slider("Projection length (months)", options=PROJ_LENGTHS, value=12, disabled=LK)
     proj_trust = st.slider("Trust in the model (0% = history only)", 0, 100, 50, 10, disabled=LK,
                            help="Shrinks the model's fan toward the unconditional historical distribution of silver's returns.")
@@ -1614,9 +1558,8 @@ with st.sidebar:
     st.caption(f"Data through {m.index[-1]:%b %Y}, downloaded {(time.time() - data_ts) / 60:.0f} min ago. Changing settings reuses it.")
     st.subheader("Indicators")
     chosen = st.multiselect("Indicators to use", available, default=default, format_func=lambda c: META_ALL[c][0], disabled=LK,
-                            help="Core set is on by default (including 5 expectation indicators). More indicators means more chances for a fluke. "
-                                 "Supply / demand / positioning proxies (CFTC, miners, solar) and the other expectation indicators are optional "
-                                 "because they add tests (and, for the proxies, shorten the usable history).")
+                            help="Core set is on by default. More indicators means more chances for a fluke. "
+                                 "Supply / demand / positioning proxies (CFTC, miners, solar) are optional because they shorten the usable history.")
 if len(chosen) < 3:
     bar.empty()
     st.error("Pick at least 3 indicators.")
@@ -1648,7 +1591,7 @@ if impl_key == "ETF" and not (m["slv"].notna().sum() > 36 and m["gld"].notna().s
 
 if "real_yield" in failed:
     st.warning("FRED did not respond, so the app is using Yahoo stand-ins (10y yield, 3-month T-bill). Real rates, inflation, M2, "
-               "industrial production, credit spreads, unemployment, financial conditions and the expectation indicators are missing. Reload later, or add a free FRED_API_KEY in Secrets.")
+               "industrial production, credit spreads, unemployment and financial conditions are missing. Reload later, or add a free FRED_API_KEY in Secrets.")
 elif failed:
     st.info("Some data series were unavailable and skipped: " + ", ".join(failed)
             + (". (cot = CFTC positioning; the rest of the app works without it.)" if "cot" in failed else ""))
