@@ -12,7 +12,7 @@ Files:
   macro_engine.py              asset-independent statistics / rules / backtest helpers (no Streamlit)
   oil_tabs_overview.py         Dashboard, Guide, Environments, Indicator ranking, Out-of-sample
   oil_tabs_analysis.py         Backtest, Explorer, Data & coverage
-  oil_tabs_expectations.py     Expectations tab (rates, inflation, growth, dollar, recession expectations and their link to oil)
+  oil_tabs_expectations.py     Expectations tab (incl. live options snapshot) and the Report (Word) tab
   silver_expectations.py       expectation engine, shared with the silver app
 
 Optional secrets (Streamlit secrets or environment): FRED_API_KEY (more reliable FRED), EIA_API_KEY (free; unlocks OPEC / world supply-demand,
@@ -163,6 +163,9 @@ def _prepare_monthly(px, fr):
     for k in ("prod_supplied", "gas_supplied"):  # weekly, noisy: 4-week average
         if k in fr:
             out[k] = avail(fr[k].rolling(4).mean(), LAGS[k]).dropna()
+    pr = (fr["oil_wti"] if "oil_wti" in fr else px["oil_fut"]).dropna()
+    pr = pr[pr > 5]  # drop the Apr-2020 negative / near-zero prints, which would explode a percentage return
+    out["oil_rv"] = pr.pct_change().rolling(21, min_periods=15).std() * np.sqrt(252) * 100
     handled = {"m2", "cpi", "indpro", "gdp", "claims", "unrate", "prod_supplied", "gas_supplied"}
     for k, s in fr.items():
         if k not in handled:
@@ -358,7 +361,8 @@ else:
     st.info("🔬 Research mode: the final test is hidden everywhere and all grading uses the validation period.")
 
 tabs_def = [("dash", "📊 Dashboard"), ("guide", "📖 Guide"), ("env", "🗺 Environments"), ("rank", "🏆 Indicator ranking"),
-            ("test", "🧪 Out-of-sample"), ("bt", "💰 Backtest"), ("exp", "🔎 Explorer"), ("xpt", "📈 Expectations"), ("data", "🗂 Data & coverage")]
+            ("test", "🧪 Out-of-sample"), ("bt", "💰 Backtest"), ("exp", "🔎 Explorer"), ("xpt", "📈 Expectations"), ("data", "🗂 Data & coverage"),
+            ("report", "📄 Report (Word)")]
 T = dict(zip([k for k, _ in tabs_def], st.tabs([n for _, n in tabs_def])))
 
 # Each tab file runs with everything defined above available as globals; what it defines is passed on to the next file.
