@@ -5,3 +5,5 @@ numpy
 plotly
 requests
 scikit-learn
+python-docx
+kaleido
