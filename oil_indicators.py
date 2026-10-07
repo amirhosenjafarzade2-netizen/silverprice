@@ -59,6 +59,8 @@ IND = [
     ("brent_wti", "Brent minus WTI ($/bbl)", "Narrow spread", "Wide spread", False, MKT, 0, False),
     ("cot_net", "Speculative positioning (CFTC WTI managed-money net, % of open interest)", "Light speculative positioning", "Crowded speculative longs", False, MKT, 0, False),
     ("ovx", "Oil volatility (OVX)", "Calm oil market", "Nervous oil market", False, MKT, 0, False),
+    ("ovx_vrp", "Oil options: implied (OVX) minus realized volatility", "Options cheap vs realized", "Options rich (fear premium)", False, MKT, 0, False),
+    ("ovx_chg", "Oil options: OVX, 3-month change", "Implied vol falling", "Implied vol rising", False, MKT, 0, False),
     ("xle_rel", "Energy stocks (XLE) vs S&P 500, 3-month relative", "Energy lagging", "Energy outperforming", True, MKT, 1, False),
     # ---- dollar & monetary
     ("dollar_mom", "US Dollar, 3-month trend", "Dollar weakening", "Dollar strengthening", True, USD, -1, True),
@@ -141,7 +143,7 @@ SOURCES = {
     "c1": ("WTI futures, contract 1", "EIA (needs EIA key)"), "c4": ("WTI futures, contract 4", "EIA (needs EIA key)"),
     "cot": ("CFTC WTI managed-money net, % of open interest", "CFTC"), "rigs": ("Baker Hughes oil rigs", "manual file"),
     "opecplus_prod": ("OPEC+ production", "manual file"), "uso": ("USO ETF (backtest vehicle)", "Yahoo"), "usl": ("USL ETF (curve proxy)", "Yahoo"),
-    "jets": ("JETS airline ETF", "Yahoo"), "ovx": ("Oil volatility index", "Yahoo"), "rb": ("RBOB gasoline futures", "Yahoo"), "ho": ("Heating oil futures", "Yahoo"),
+    "jets": ("JETS airline ETF", "Yahoo"), "ovx": ("Oil volatility index (options-implied)", "Yahoo"), "oil_rv": ("WTI realized volatility, 21 days", "computed from the price"), "rb": ("RBOB gasoline futures", "Yahoo"), "ho": ("Heating oil futures", "Yahoo"),
 }
 
 
@@ -183,6 +185,7 @@ def build_features(m):
     F["oil_val"] = exp_pctl(oil / cpi if cpi.notna().any() else oil)
     F["brent_wti"] = g("oil_brent") - g("oil_wti")
     F["cot_net"], F["ovx"] = g("cot"), g("ovx")
+    F["ovx_vrp"], F["ovx_chg"] = g("ovx") - g("oil_rv"), g("ovx").diff(3)
     F["xle_rel"] = (g("xle") / g("spx")).pct_change(3)
     # dollar & monetary
     F["dollar_mom"] = g("dollar").pct_change(3)
