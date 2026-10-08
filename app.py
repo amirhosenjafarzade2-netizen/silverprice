@@ -14,8 +14,10 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 # st.set_page_config must be the first Streamlit call, so it lives here.
-# (Silver title / icon for now; the oil page sets its own title inside oil_main.py.)
-st.set_page_config(page_title="Silver Macro Environment Analyzer", page_icon="🥈", layout="wide")
+# Title / icon follow the asset chosen on the previous run (the selectbox below is created after this call).
+_PAGE = {"Silver": ("Silver Macro Environment Analyzer", "🥈"), "Oil": ("Oil Macro Environment Analyzer", "🛢️")}
+_t, _i = _PAGE.get(st.session_state.get("asset_choice", "Silver"), ("Macro Environment Analyzer", "📊"))
+st.set_page_config(page_title=_t, page_icon=_i, layout="wide")
 
 ASSETS = {
     "Gold": "gold_main.py",
@@ -34,7 +36,7 @@ with st.sidebar:
 path = os.path.join(HERE, ASSETS[asset])
 if not os.path.exists(path):
     st.title(f"{asset} Macro Environment Analyzer")
-    st.info(f"The {asset} analyzer is not built yet (it will load from `{ASSETS[asset]}`). Silver and Oil are available right now.")
+    st.info(f"The {asset} analyzer is not built yet (it will load from `{ASSETS[asset]}`). Only Silver and Oil are available right now.")
     st.stop()
 
 runpy.run_path(path, run_name="__main__")
