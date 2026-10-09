@@ -1,5 +1,5 @@
 """
-Bitcoin Macro Environment Analyzer (Streamlit), v1.0 (ported from the Silver / Oil analyzers)
+Bitcoin Macro Environment Analyzer (Streamlit), improved reliability build
 
 Which macro AND on-chain environments have been historically favorable / unfavorable for bitcoin, what regime are we in,
 what happened in comparable periods, and would following it have worked (with costs)?
@@ -7,7 +7,7 @@ what happened in comparable periods, and would following it have worked (with co
 requirements.txt: streamlit, yfinance, pandas, numpy, plotly, requests, scikit-learn, scipy (python-docx, kaleido for the Word report)
 Optional: FRED_API_KEY in Streamlit secrets for reliable FRED access (and for first-release / ALFRED data).
 No key is needed for the on-chain data (Coin Metrics Community API, blockchain.com, DefiLlama, alternative.me).
-Educational only, not financial advice.
+Educational only, not financial advice. Backtests and forecasts are exploratory, not evidence of a durable edge.
 
 Files:
   app.py                         asset chooser (this file is started from there)
@@ -270,9 +270,16 @@ def _fred_fetch(series_id, start, key):
                 r = requests.get(url, timeout=(5, 20), headers={"User-Agent": "Mozilla/5.0"})
                 r.raise_for_status()
                 d = pd.read_csv(io.StringIO(r.text), na_values=[".", ""])
+                # FRED graph CSV normally has DATE + series-id columns; do not
+                # assume the response always has exactly two columns.
+                if d.shape[1] < 2:
+                    raise ValueError(f"Unexpected FRED CSV format for {series_id}")
+                d = d.iloc[:, :2].copy()
                 d.columns = ["date", "value"]
-            d["date"] = pd.to_datetime(d["date"])
-            return d.set_index("date")["value"].astype(float)
+            d["date"] = pd.to_datetime(d["date"], errors="coerce")
+            d["value"] = pd.to_numeric(d["value"], errors="coerce")
+            d = d.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+            return d.set_index("date")["value"].astype(float).sort_index()
         except Exception as e:  # noqa: BLE001
             last = e
     raise last
@@ -333,8 +340,61 @@ def _cot_fetch(start):
 
 
 def _yahoo_fetch(start):
-    px = yf.download(list(YF.values()), start=start, auto_adjust=True, progress=False, threads=True)["Close"]
-    return px.rename(columns={v: k for k, v in YF.items()})
+    """Download Yahoo prices and normalize both old and new yfinance column layouts.
+
+    yfinance has returned flat columns in some versions and MultiIndex columns in
+    others. A failed ticker should not silently shift columns onto the wrong asset.
+    """
+    tickers = list(dict.fromkeys(YF.values()))
+    raw = yf.download(
+        tickers=tickers,
+        start=start,
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+        group_by="column",
+        actions=False,
+        timeout=30,
+    )
+    if raw is None or raw.empty:
+        raise ValueError("Yahoo Finance returned an empty price table. Try refreshing later.")
+
+    # Extract Close robustly for flat columns and either orientation of MultiIndex.
+    if isinstance(raw.columns, pd.MultiIndex):
+        close = None
+        for level in range(raw.columns.nlevels):
+            vals = raw.columns.get_level_values(level)
+            if "Close" in vals:
+                close = raw.xs("Close", axis=1, level=level, drop_level=True)
+                break
+        if close is None:
+            raise ValueError("Yahoo Finance response did not contain a Close price field.")
+        if isinstance(close, pd.Series):
+            close = close.to_frame()
+        if isinstance(close.columns, pd.MultiIndex):
+            close.columns = close.columns.get_level_values(-1)
+    else:
+        if "Close" not in raw.columns:
+            raise ValueError("Yahoo Finance response did not contain a Close price field.")
+        close = raw["Close"]
+        if isinstance(close, pd.Series):
+            close = close.to_frame(name=tickers[0] if len(tickers) == 1 else "Close")
+
+    close = close.copy()
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    if getattr(close.index, "tz", None) is not None:
+        close.index = close.index.tz_localize(None)
+    close = close.loc[~close.index.isna()]
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    close = close.rename(columns={v: k for k, v in YF.items()})
+    for col in set(YF) - set(close.columns):
+        close[col] = np.nan
+    close = close.reindex(columns=list(YF))
+    for col in close:
+        close[col] = pd.to_numeric(close[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if close["btc"].notna().sum() < 100:
+        raise ValueError("Yahoo Finance returned fewer than 100 valid BTC-USD prices.")
+    return close
 
 
 def month_end(df):
@@ -348,16 +408,29 @@ DATA_START = "1990-01-01"  # always download the full history once; the sidebar 
 
 
 def _avail(s, k, rel):
-    """Re-index an observation-dated series by the date each value became available.
-    With first-release data the real release date is used when it looks sane (0-150 days after the observation); otherwise the PUB_LAG rule."""
-    months, days = PUB_LAG[k]
-    lagged = (s.index + pd.DateOffset(months=months) + pd.Timedelta(days=days)).values
+    """Re-index observation-dated values by estimated/recorded publication date.
+
+    A vintage release date is accepted only when it is between the observation
+    date and 150 days later; otherwise the conservative configured lag is used.
+    Duplicate availability dates keep the latest observation, avoiding ambiguous
+    ordering when several releases map to one day.
+    """
+    if s is None or len(s) == 0:
+        return pd.Series(dtype=float)
+    s = pd.to_numeric(s, errors="coerce").dropna().sort_index()
+    obs = pd.DatetimeIndex(pd.to_datetime(s.index, errors="coerce"))
+    valid = ~obs.isna()
+    s = s.iloc[np.flatnonzero(valid)]
+    obs = obs[valid]
+    months, days = PUB_LAG.get(k, (0, 0))
+    lagged = obs + pd.DateOffset(months=months) + pd.Timedelta(days=days)
     idx = lagged
     if k in rel:
-        rv = rel[k].reindex(s.index).values
-        ok = (~pd.isna(rv)) & (rv >= s.index.values) & (rv <= (s.index + pd.Timedelta(days=150)).values)
-        idx = np.where(ok, rv, lagged)
-    out = pd.Series(s.values, index=pd.DatetimeIndex(idx))
+        rv = pd.to_datetime(rel[k].reindex(s.index), errors="coerce")
+        rv = pd.DatetimeIndex(rv)
+        ok = (~rv.isna()) & (rv >= obs) & (rv <= (obs + pd.Timedelta(days=150)))
+        idx = pd.DatetimeIndex(np.where(ok, rv.values, lagged.values))
+    out = pd.Series(s.to_numpy(dtype=float), index=idx, dtype=float)
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
@@ -493,11 +566,20 @@ def get_dataset(key, vintage=False):
     if "price" in raw:  # Coin Metrics reference price fills the days before Yahoo's BTC-USD begins (Sept 2014) and any gaps
         px = px.join(raw["price"].rename("_cm"), how="outer")
         px["btc"] = px["btc"].fillna(px.pop("_cm"))
+    px = px.loc[~px.index.duplicated(keep="last")].sort_index()
+    px = px.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     price = px["btc"].dropna()
+    if price.index.has_duplicates or not price.index.is_monotonic_increasing:
+        price = price[~price.index.duplicated(keep="last")].sort_index()
     chain = build_onchain(price, raw if len(raw) else None, stable, fng)
     m_all, failed = _prepare_monthly(px, fr, failed, rel, chain)
+    m_all = m_all.loc[~m_all.index.duplicated(keep="last")].sort_index()
+    m_all = m_all.replace([np.inf, -np.inf], np.nan)
     F = build_features(m_all)
-    P = F.apply(exp_pctl)  # percentiles use the full macro history (point-in-time), then everything is cut to the months where bitcoin exists
+    F = F.loc[~F.index.duplicated(keep="last")].sort_index()
+    # Percentiles are expanding and exclude the current observation from its own
+    # comparison, so this remains point-in-time rather than full-sample ranking.
+    P = F.apply(exp_pctl)
     first = m_all["btc"].first_valid_index()
     return m_all.loc[first:], F.loc[first:], P.loc[first:], failed, time.time()
 
@@ -1036,11 +1118,20 @@ def known(wf, fwd, idx=None):
 
 @st.cache_data(show_spinner=False)
 def fit_today(F, fwd, x_now, model_name):
+    """Fit on outcomes known today; gracefully handle tiny/one-class samples."""
     k = fwd.notna().values
     y = (fwd.values[k] > 0).astype(int)
     Fk = F.loc[k]
+    if len(y) < 2 or len(np.unique(y)) < 2:
+        # A classifier cannot learn from a single class. Return its empirical
+        # base rate rather than crashing the whole dashboard.
+        p = float(y.mean()) if len(y) else 0.5
+        imp = pd.Series(0.0, index=F.columns)
+        return p, p, imp, None
     mdl = make_model(model_name).fit(Fk.values, y)
-    p = float(mdl.predict_proba(x_now.values.reshape(1, -1))[0, 1])
+    probs = mdl.predict_proba(x_now.values.reshape(1, -1))[0]
+    classes = list(mdl.classes_) if hasattr(mdl, "classes_") else list(mdl[-1].classes_)
+    p = float(probs[classes.index(1)]) if 1 in classes else 0.0
     contrib = None
     if hasattr(mdl, "steps"):  # logistic: exact additive contributions in log-odds
         sc, lr = mdl[0], mdl[-1]
