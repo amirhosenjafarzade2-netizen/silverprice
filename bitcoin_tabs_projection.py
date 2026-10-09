@@ -22,20 +22,43 @@ PROJ_REPORT = {}
 
 # ------------------------------------------------------------------ projection (ML route fan)
 def proj_rank_ic(a, b):
-    d = pd.concat([pd.Series(np.asarray(a, float)), pd.Series(np.asarray(b, float))], axis=1).dropna()
-    if len(d) < 8 or d.iloc[:, 0].nunique() < 2:
+    """Spearman/rank IC, returning NaN when the sample is too small or degenerate."""
+    try:
+        aa = np.asarray(a, dtype=float).reshape(-1)
+        bb = np.asarray(b, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
         return np.nan
-    return d.iloc[:, 0].rank().corr(d.iloc[:, 1].rank())
+    if aa.size != bb.size:
+        return np.nan
+    d = pd.DataFrame({"a": aa, "b": bb}).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(d) < 8 or d["a"].nunique() < 2 or d["b"].nunique() < 2:
+        return np.nan
+    v = d["a"].rank().corr(d["b"].rank())
+    return float(v) if pd.notna(v) and np.isfinite(v) else np.nan
 
 
 def pinball(y, Q, qs=PROJ_Q):
-    e = np.asarray(y)[:, None] - Q
-    qa = np.asarray(qs)
+    """Mean quantile loss with explicit shape and finite-value checks."""
+    yy = np.asarray(y, dtype=float).reshape(-1)
+    qq = np.asarray(Q, dtype=float)
+    qa = np.asarray(qs, dtype=float).reshape(-1)
+    if qq.ndim == 1:
+        qq = qq.reshape(-1, 1)
+    if qq.ndim != 2 or qq.shape != (len(yy), len(qa)) or not len(yy) or not len(qa):
+        return np.nan
+    if not np.isfinite(qa).all() or np.any((qa <= 0) | (qa >= 1)):
+        return np.nan
+    ok = np.isfinite(yy) & np.isfinite(qq).all(axis=1)
+    if not ok.any():
+        return np.nan
+    e = yy[ok, None] - qq[ok]
     return float(np.maximum(qa * e, (qa - 1) * e).mean())
 
 
 def proj_price_features(m, idx):
-    s = m["btc"]
+    if "btc" not in m.columns:
+        raise KeyError("Projection requires a 'btc' price column in the monthly market frame.")
+    s = pd.to_numeric(m["btc"], errors="coerce").where(lambda x: x > 0)
     f = pd.DataFrame(index=m.index)
     f["px_mom1"], f["px_mom3"] = s.pct_change(1), s.pct_change(3)
     f["px_mom6"], f["px_mom12"] = s.pct_change(6), s.pct_change(12)
@@ -46,8 +69,13 @@ def proj_price_features(m, idx):
 
 
 def proj_inputs(m, F_ok, feats, length, E_exp=None):
-    """Features known at each month-end and forward log returns for every grid horizon up to `length`.
-    E_exp = frame of the expectation indicators (point-in-time). PROJ_FEATS[3] adds those not already in F_ok; PROJ_FEATS[4] uses all of them with bitcoin momentum."""
+    """Build point-in-time features and forward log-return targets without infinities."""
+    if not isinstance(F_ok, pd.DataFrame):
+        raise TypeError("F_ok must be a pandas DataFrame.")
+    if "btc" not in m.columns:
+        raise KeyError("Projection requires m['btc'].")
+    F_ok = F_ok.copy()
+    F_ok = F_ok.loc[:, ~F_ok.columns.duplicated()]
     pf = proj_price_features(m, F_ok.index)
     ex_all = E_exp.reindex(F_ok.index) if E_exp is not None and len(E_exp.columns) else pd.DataFrame(index=F_ok.index)
     ex_new = ex_all[[c for c in ex_all.columns if c not in F_ok.columns]]
@@ -61,29 +89,55 @@ def proj_inputs(m, F_ok, feats, length, E_exp=None):
         X = pd.concat([ex_all, pf], axis=1)
     else:
         X = pd.concat([F_ok, pf], axis=1)
-    X = X.replace([np.inf, -np.inf], np.nan).dropna()
-    ks = [k for k in PROJ_GRID if k <= length]
-    s = m["btc"]
+    X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    ks = sorted({int(k) for k in PROJ_GRID if int(k) > 0 and int(k) <= int(length)})
+    s = pd.to_numeric(m["btc"], errors="coerce").where(lambda x: x > 0)
     Y = pd.DataFrame({k: np.log(s.shift(-k) / s) for k in ks}).reindex(X.index)
+    Y = Y.replace([np.inf, -np.inf], np.nan)
     return X, Y, ks
 
 
 def _fit_quantiles(model_name, Xtr, ytr, qs, Xte):
-    """Predicted quantiles (rows = Xte, columns = qs)."""
+    """Predict quantiles (rows = Xte, columns = qs), filtering invalid training rows."""
+    Xtr = np.asarray(Xtr, dtype=float)
+    Xte = np.asarray(Xte, dtype=float)
+    ytr = np.asarray(ytr, dtype=float).reshape(-1)
+    qs = np.asarray(qs, dtype=float).reshape(-1)
+    if Xtr.ndim != 2 or Xte.ndim != 2 or Xtr.shape[1] != Xte.shape[1] or len(Xtr) != len(ytr):
+        raise ValueError("Projection model received incompatible feature/target shapes.")
+    if not len(qs) or not np.isfinite(qs).all() or np.any((qs <= 0) | (qs >= 1)):
+        raise ValueError("Quantile levels must be finite and strictly between 0 and 1.")
+    good = np.isfinite(ytr) & np.isfinite(Xtr).all(axis=1)
+    Xtr, ytr = Xtr[good], ytr[good]
+    if not len(ytr):
+        raise ValueError("No finite training rows are available for the projection model.")
+    if not np.isfinite(Xte).all():
+        raise ValueError("Projection features contain missing or infinite values at prediction time.")
     if model_name == PJ_RIDGE:
         mdl = make_pipeline(StandardScaler(), Ridge(alpha=PROJ_ALPHA)).fit(Xtr, ytr)
         rq = np.quantile(ytr - mdl.predict(Xtr), qs)
-        return mdl.predict(Xte)[:, None] + rq[None, :]
-    cols = [GradientBoostingRegressor(loss="quantile", alpha=q, n_estimators=40, max_depth=2, learning_rate=0.05, subsample=0.8,
-                                      min_samples_leaf=10, random_state=0).fit(Xtr, ytr).predict(Xte) for q in qs]
-    return np.sort(np.column_stack(cols), axis=1)
+        pred = mdl.predict(Xte)[:, None] + rq[None, :]
+    else:
+        min_leaf = max(2, min(10, len(ytr) // 10))
+        cols = [GradientBoostingRegressor(loss="quantile", alpha=float(q), n_estimators=40, max_depth=2, learning_rate=0.05,
+                                          subsample=0.8, min_samples_leaf=min_leaf, random_state=0).fit(Xtr, ytr).predict(Xte)
+                for q in qs]
+        pred = np.column_stack(cols)
+    return np.sort(np.asarray(pred, dtype=float), axis=1)
 
 
 @st.cache_data(show_spinner=False)
 def proj_walk_forward(X, Y, qs, cut, end, step, model_name):
     """Every `step` months refit using only rows whose k-month outcome was already known, predict the next `step` months.
     Returns {k: (dates, model quantiles, history-only quantiles, realised log return)}. No Streamlit calls inside."""
+    if not isinstance(X, pd.DataFrame) or not isinstance(Y, pd.DataFrame) or not X.index.equals(Y.index):
+        return {}
+    step = max(1, int(step))
+    cut = max(0, min(int(cut), len(X)))
+    end = max(cut, min(int(end), len(X)))
     Xv, idx, out = X.values.astype(float), X.index, {}
+    if not len(Xv) or end <= cut:
+        return out
     for k in Y.columns:
         yv = Y[k].values.astype(float)
         dts, M, B, yy = [], [], [], []
@@ -105,6 +159,8 @@ def proj_walk_forward(X, Y, qs, cut, end, step, model_name):
 @st.cache_data(show_spinner=False)
 def proj_fit_today(X, Y, qs, model_name):
     """Fit on every row whose outcome is known and predict from the latest month. Returns (horizons, model quantiles, history quantiles)."""
+    if not isinstance(X, pd.DataFrame) or not isinstance(Y, pd.DataFrame) or not X.index.equals(Y.index) or X.empty:
+        return [], np.empty((0, len(PROJ_Q))), np.empty((0, len(PROJ_Q)))
     Xv = X.values.astype(float)
     ks, Qm, Qb = [], [], []
     for k in Y.columns:
@@ -135,18 +191,45 @@ def _combine_wf(parts):
 
 def to_curve(ks, Q, L):
     """Interpolate per-horizon quantiles to every month 0..L (0 at month 0)."""
+    ks = np.asarray(ks, dtype=int).reshape(-1)
+    Q = np.asarray(Q, dtype=float)
+    L = max(0, int(L))
+    if Q.ndim != 2 or len(ks) != len(Q) or Q.shape[1] == 0:
+        return np.zeros((L + 1, 0), dtype=float)
+    order = np.argsort(ks)
+    ks, Q = ks[order], Q[order]
+    keep = (ks > 0) & np.isfinite(ks)
+    ks, Q = ks[keep], Q[keep]
+    if not len(ks):
+        return np.zeros((L + 1, Q.shape[1]), dtype=float)
+    # Deduplicate horizons defensively before interpolation.
+    _, first = np.unique(ks, return_index=True)
+    ks, Q = ks[np.sort(first)], Q[np.sort(first)]
     mo = np.arange(0, L + 1)
-    return np.column_stack([np.interp(mo, [0] + list(ks), [0.0] + list(Q[:, j])) for j in range(Q.shape[1])])
+    return np.column_stack([np.interp(mo, np.r_[0, ks], np.r_[0.0, Q[:, j]]) for j in range(Q.shape[1])])
 
 
 def proj_paths(Qc, qs, S0, n=PROJ_PATHS, seed=7):
     """Routes whose month-j value follows the predicted quantiles of month j exactly. A standardised random walk (W_j / sqrt(j) ~ N(0,1))
     supplies the month-to-month dependence; each month's z-score is mapped through that month's quantile curve (linear tails)."""
+    Qc = np.asarray(Qc, dtype=float)
+    qs = np.asarray(qs, dtype=float).reshape(-1)
+    n = max(1, int(n))
+    if Qc.ndim != 2 or Qc.shape[0] < 1 or Qc.shape[1] != len(qs) or not len(qs):
+        return np.full((n, 1), float(S0))
     L = Qc.shape[0] - 1
-    zq = ndtri(np.asarray(qs))
+    if L <= 0:
+        return np.full((n, 1), float(S0))
+    zq = ndtri(np.clip(qs, 1e-6, 1 - 1e-6))
+    order = np.argsort(qs)
+    qs, zq = qs[order], zq[order]
+    Qc = Qc[:, order]
     rng = np.random.default_rng(seed)
-    e = rng.standard_normal((n // 2, L))
-    e = np.vstack([e, -e])  # antithetic pairs
+    pairs = n // 2
+    e = rng.standard_normal((pairs, L))
+    e = np.vstack([e, -e]) if pairs else np.empty((0, L))  # antithetic pairs
+    if n % 2:
+        e = np.vstack([e, rng.standard_normal((1, L))])
     Z = np.cumsum(e, axis=1) / np.sqrt(np.arange(1, L + 1))
     lr = np.zeros((len(e), L + 1))
     for j in range(1, L + 1):
@@ -158,12 +241,15 @@ def proj_paths(Qc, qs, S0, n=PROJ_PATHS, seed=7):
         y = np.where(z < zq[0], v[0] + slo * (z - zq[0]), y)
         y = np.where(z > zq[-1], v[-1] + shi * (z - zq[-1]), y)
         lr[:, j] = y
-    return S0 * np.exp(lr)
+    paths = float(S0) * np.exp(np.clip(lr, -50, 50))
+    return paths[:n]
 
 
 def proj_score(wfd, lam, eval_idx, ks):
     """Walk-forward grade on unseen months: model fan (shrunk by lam toward history) versus the history-only fan."""
     rows, mid = [], len(PROJ_Q) // 2
+    if not wfd or len(PROJ_Q) < 3:
+        return pd.DataFrame(columns=["k", "n", "ic", "hit", "skill", "c80", "c50"])
     for k in ks:
         if k not in wfd:
             continue
