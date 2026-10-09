@@ -1,142 +1,365 @@
 """
 Bitcoin tabs: On-chain (valuation, network, liquidity-in-crypto and sentiment indicators).
-Executed by bitcoin_main.py (all config, helpers and results are available as globals).
+Executed by bitcoin_main.py; shared configuration, helpers and data are expected as globals.
 """
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-_CK = [c for c in CHAIN_KEYS if c in F_full.columns and F_full[c].notna().any()]
+
+# Keep this module compatible with the shared-global execution model used by bitcoin_main.py.
+_CHAIN_KEYS = list(globals().get("CHAIN_KEYS", []))
+_F_FULL = globals().get("F_full")
+_P_FULL = globals().get("P_full")
+_META = globals().get("META_ALL", {})
+_INFO = globals().get("ONCHAIN_INFO", {})
+_VAL = globals().get("VAL", "Valuation")
+_NET = globals().get("NET", "Network")
+_SENT = globals().get("SENT", "Sentiment")
+_PIL_ORDER = [_VAL, _NET, _SENT]
 _SIGN_TXT_C = {1: "Positive", -1: "Negative", 0: "Mixed"}
-_PIL_ORDER = [VAL, NET, SENT]
+
+
+def _is_num(value):
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _meta(c, pos, default="Unknown"):
+    """Read metadata safely while preserving the main module's tuple format."""
+    item = _META.get(c, ())
+    try:
+        value = item[pos]
+        return default if value is None else value
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def _info(c, key, default="Not documented in metadata."):
+    item = _INFO.get(c, {})
+    value = item.get(key, default) if isinstance(item, dict) else default
+    return default if value is None else value
+
+
+def _sign(c):
+    try:
+        sign = int(_info(c, "sign", 0))
+        return sign if sign in (-1, 0, 1) else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _percentile(c):
+    """Return the latest available historical percentile, or NaN."""
+    if not isinstance(_P_FULL, pd.DataFrame) or c not in _P_FULL.columns:
+        return np.nan
+    s = pd.to_numeric(_P_FULL[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return np.nan
+    value = s.iloc[-1]
+    return float(value) if _is_num(value) else np.nan
 
 
 def _state_txt(c, p):
-    if pd.isna(p):
+    if not _is_num(p):
         return "-"
-    return ("🟢 " if p <= 1 / 3 else ("⚪ " if p <= 2 / 3 else "🟠 ")) + (META_ALL[c][1] if p <= 1 / 3 else ("Middle of its range" if p <= 2 / 3 else META_ALL[c][2]))
+    p = float(p)
+    if p <= 1 / 3:
+        return "🟢 " + str(_meta(c, 1, "Low vs its own history"))
+    if p <= 2 / 3:
+        return "⚪ Middle of its range"
+    return "🟠 " + str(_meta(c, 2, "High vs its own history"))
+
+
+def _safe_fmt(c, value):
+    fn = globals().get("fmt_val")
+    if callable(fn):
+        try:
+            return fn(c, value)
+        except Exception:
+            pass
+    if not _is_num(value):
+        return "—"
+    return f"{float(value):,.3g}"
+
+
+def _safe_show_df(frame):
+    fn = globals().get("show_df")
+    if callable(fn):
+        fn(st, frame)
+    else:
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+
+
+def _safe_show_plot(fig):
+    fn = globals().get("show_plot")
+    if callable(fn):
+        fn(st, fig)
+    else:
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _valid_frame():
+    return isinstance(_F_FULL, pd.DataFrame) and not _F_FULL.empty
+
+
+def _safe_first_month(series):
+    idx = series.first_valid_index()
+    if idx is None:
+        return "—"
+    try:
+        return pd.Timestamp(idx).strftime("%b %Y")
+    except (TypeError, ValueError):
+        return str(idx)
+
+
+def _safe_rank_ic(x, y):
+    fn = globals().get("rank_ic")
+    if not callable(fn):
+        return np.nan
+    try:
+        result = fn(x, y)
+        return float(result) if _is_num(result) else np.nan
+    except Exception:
+        return np.nan
+
+
+# Build the list only after validating the shared data frame and indicator columns.
+if _valid_frame():
+    _CK = [
+        c for c in _CHAIN_KEYS
+        if c in _F_FULL.columns
+        and pd.to_numeric(_F_FULL[c], errors="coerce").notna().any()
+    ]
+else:
+    _CK = []
 
 
 with T["chain"]:
     st.subheader("⛓ On-chain: what the Bitcoin network, its holders and its miners are doing")
-    st.caption("Valuation, network and crypto-market indicators built from free public sources (Coin Metrics Community, blockchain.com, DefiLlama, alternative.me, CFTC). "
-               "Every value is **point-in-time**: delayed by a publication lag and built from trailing windows only. "
-               "Percentiles compare today's value with PAST months only. They describe where bitcoin stands in its own history; they are not forecasts.")
-    miss = [k for k in failed if k.startswith("chain:") or k in ("onchain", "stablecoins", "fng", "cot")]
+    st.caption(
+        "Valuation, network and crypto-market indicators built from free public sources "
+        "(Coin Metrics Community, blockchain.com, DefiLlama, alternative.me, CFTC). "
+        "Every value is point-in-time: delayed by a publication lag and built from trailing windows only. "
+        "Percentiles compare today's value with past months only. They describe where bitcoin stands "
+        "in its own history; they are not forecasts."
+    )
+
+    _failed = list(globals().get("failed", []))
+    miss = [k for k in _failed if str(k).startswith("chain:") or k in ("onchain", "stablecoins", "fng", "cot")]
     if "onchain" in miss:
-        st.error("The Coin Metrics / blockchain.com on-chain download failed, so no on-chain valuation or network indicator is available. Click 'Refresh data' later.")
+        st.error(
+            "The Coin Metrics / blockchain.com on-chain download failed, so no on-chain valuation "
+            "or network indicator is available. Click 'Refresh data' later."
+        )
     elif miss:
-        st.warning("Some on-chain inputs did not download (" + ", ".join(miss) + "), so the indicators that need them are missing.")
+        st.warning("Some on-chain inputs did not download (" + ", ".join(map(str, miss)) + "); indicators that need them may be missing.")
+
     if not _CK:
-        st.info("No on-chain indicator could be built (only the halving cycle would need no download; it needs at least the Yahoo price history).")
+        st.info("No on-chain indicator could be built from the available data. Check the downloads and refresh the data.")
     else:
-        last = F_full[_CK].dropna(how="all").index[-1]
-        st.markdown(f"**Latest read: {last:%b %Y}** (values are the last known at that month-end).")
-
-        # ---------------- headline cards
-        head = [c for c in ("mvrv", "mvrv_z", "mayer", "puell", "hash_ribbon", "adr_mom", "stable_mom", "fng") if c in _CK][:8]
-        for row_cols in [head[i:i + 4] for i in range(0, len(head), 4)]:
-            cols_ = st.columns(len(row_cols))
-            for col_, c in zip(cols_, row_cols):
-                s_ = F_full[c].dropna()
-                box = card(col_)
-                now_v = s_.iloc[-1]
-                prev = F_full[c].shift(3).loc[s_.index[-1]]
-                p_ = P_full[c].dropna().iloc[-1] if c in P_full and P_full[c].notna().any() else np.nan
-                box.metric(META_ALL[c][0], fmt_val(c, now_v), None if pd.isna(prev) else (f"{(now_v - prev) * 100:+.1f} pts vs 3m ago" if META_ALL[c][3] else f"{now_v - prev:+.2f} vs 3m ago"),
-                           delta_color="off")
-                box.caption(f"{'-' if pd.isna(p_) else f'{p_:.0%} of its own past months were lower'}")
-
-        # ---------------- readings table
-        st.markdown("#### All readings")
-        rows = []
-        for pil in _PIL_ORDER:
-            for c in [x for x in _CK if META_ALL[x][4] == pil]:
-                s_ = F_full[c].dropna()
-                p_ = P_full[c].dropna().iloc[-1] if c in P_full and P_full[c].notna().any() else np.nan
-                rows.append({"Pillar": pil, "Indicator": META_ALL[c][0], "Latest": fmt_val(c, s_.iloc[-1]),
-                             "Percentile vs past": "-" if pd.isna(p_) else f"{p_:.0%}", "Reading": _state_txt(c, p_),
-                             "First month": s_.index[0].strftime("%b %Y"), "Textbook sign when HIGH": _SIGN_TXT_C[ONCHAIN_INFO[c]["sign"]]})
-        show_df(st, pd.DataFrame(rows))
-
-        # ---------------- textbook tally
-        sup = uns = neu = mix = 0
-        for c in _CK:
-            sg = ONCHAIN_INFO[c]["sign"]
-            p_ = P_full[c].dropna().iloc[-1] if c in P_full and P_full[c].notna().any() else np.nan
-            if sg == 0:
-                mix += 1
-            elif pd.isna(p_):
-                continue
-            elif (p_ >= 2 / 3 and sg > 0) or (p_ <= 1 / 3 and sg < 0):
-                sup += 1
-            elif (p_ >= 2 / 3 and sg < 0) or (p_ <= 1 / 3 and sg > 0):
-                uns += 1
-            else:
-                neu += 1
-        st.markdown(f"**Textbook read:** {sup} on-chain indicator(s) point in bitcoin's favor, {uns} against, {neu} in the middle of their range, {mix} have no clear textbook sign. "
-                    "'Textbook' = the usual cycle story (valuation low vs holders' cost basis, miners recovering and activity rising are good; overheated valuation is bad). "
-                    "It is a checklist, not evidence: the table below shows what the data in THIS sample says. Bitcoin has only about three full cycles, so be skeptical of any cycle rule.")
-
-        # ---------------- history chart
-        st.markdown("#### History")
-        pick = st.selectbox("Indicator", _CK, format_func=lambda c: META_ALL[c][0], key="chain_pick")
-        s_ = F_full[pick].loc[start:].dropna()
-        if s_.empty:
-            st.info("No history for this indicator after the chosen start date.")
+        _latest_rows = _F_FULL[_CK].dropna(how="all")
+        if _latest_rows.empty:
+            st.info("No usable on-chain observations are available.")
         else:
-            k_ = 100.0 if META_ALL[pick][3] else 1.0
-            f = go.Figure()
-            f.add_scatter(x=s_.index, y=s_.values * k_, name=META_ALL[pick][0] + (" (%)" if META_ALL[pick][3] else ""), line=dict(color="#1f5fbf", width=2.5))
-            pv = P_full[pick].reindex(s_.index) if pick in P_full else None
-            if pick == "mvrv":
-                f.add_hline(y=1.0, line_dash="dot", line_color="#2e8b57", annotation_text="1.0: price = holders' average cost")
-            sv = m["btc"].reindex(s_.index)
-            f.add_scatter(x=sv.index, y=sv.values, name="Bitcoin, USD (right axis, log)", yaxis="y2", line=dict(color="#999", width=1.5))
-            f.update_layout(title=META_ALL[pick][0], height=420, yaxis2=dict(overlaying="y", side="right", showgrid=False, type="log"), legend=dict(orientation="h", y=-0.2))
-            show_plot(st, f)
-            st.caption(f"**How it is built.** {ONCHAIN_INFO[pick]['how']}  \n*Source:* {ONCHAIN_INFO[pick]['src']}.")
+            last = _latest_rows.index[-1]
+            try:
+                st.markdown(f"**Latest read: {pd.Timestamp(last):%b %Y}** (last known observation at that month-end).")
+            except (TypeError, ValueError):
+                st.markdown(f"**Latest read: {last}** (last known observation at that month-end).")
 
-        # ---------------- link to bitcoin's outcome
-        st.markdown(f"#### Do these indicators line up with bitcoin's {h}-month outcome? ({target_name.lower()})")
-        rows = []
-        for c in _CK:
-            x_ = F_full[c].reindex(fwd.index)
-            xl, yl, xt, yt = x_.loc[learn_idx], fwd.loc[learn_idx], x_.loc[unseen_idx], fwd.loc[unseen_idx]
-            ic_l, ic_t = rank_ic(xl, yl), rank_ic(xt, yt)
-            dl = pd.concat([xl, yl], axis=1).dropna()
-            t_l = nw_t(dl.iloc[:, 1].rank().values, dl.iloc[:, 0].rank().values, h) if len(dl) > 8 else np.nan
-            same = bool(pd.notna(ic_l) and pd.notna(ic_t) and np.sign(ic_l) == np.sign(ic_t))
-            if pd.isna(ic_l) or pd.isna(ic_t):
-                status = "-"
-            elif not same:
-                status = "❌ Flips on unseen data"
-            elif abs(t_l) >= 2:
-                status = "✅ Consistent and significant"
+            # ---------------- headline cards
+            _head_candidates = ("mvrv", "mvrv_z", "mayer", "puell", "hash_ribbon", "adr_mom", "stable_mom", "fng")
+            head = [c for c in _head_candidates if c in _CK][:8]
+            for row_start in range(0, len(head), 4):
+                row_cols = head[row_start:row_start + 4]
+                cols_ = st.columns(len(row_cols))
+                for col_, c in zip(cols_, row_cols):
+                    s_ = pd.to_numeric(_F_FULL[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                    if s_.empty:
+                        continue
+                    now_v = s_.iloc[-1]
+                    # Compare to the value three rows/months before the latest observation,
+                    # not to a potentially absent date in a sparse indicator series.
+                    prev_series = pd.to_numeric(_F_FULL[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+                    prev_pos = _F_FULL.index.get_indexer([s_.index[-1]])
+                    prev = np.nan
+                    if len(prev_pos) and prev_pos[0] >= 3:
+                        prev = prev_series.iloc[prev_pos[0] - 3]
+                    p_ = _percentile(c)
+                    card_fn = globals().get("card")
+                    box = card_fn(col_) if callable(card_fn) else col_
+                    is_pct = bool(_meta(c, 3, False))
+                    if _is_num(prev):
+                        delta = f"{(float(now_v) - float(prev)) * 100:+.1f} pts vs 3m ago" if is_pct else f"{float(now_v) - float(prev):+.2f} vs 3m ago"
+                    else:
+                        delta = None
+                    box.metric(str(_meta(c, 0, c)), _safe_fmt(c, now_v), delta, delta_color="off")
+                    box.caption("—" if not _is_num(p_) else f"{p_:.0%} of its own past months were lower")
+
+            # ---------------- readings table
+            st.markdown("#### All readings")
+            rows = []
+            for pil in _PIL_ORDER:
+                for c in [x for x in _CK if _meta(x, 4, None) == pil]:
+                    s_ = pd.to_numeric(_F_FULL[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                    if s_.empty:
+                        continue
+                    p_ = _percentile(c)
+                    rows.append({
+                        "Pillar": pil,
+                        "Indicator": _meta(c, 0, c),
+                        "Latest": _safe_fmt(c, s_.iloc[-1]),
+                        "Percentile vs past": "—" if not _is_num(p_) else f"{p_:.0%}",
+                        "Reading": _state_txt(c, p_),
+                        "First month": _safe_first_month(s_),
+                        "Textbook sign when HIGH": _SIGN_TXT_C[_sign(c)],
+                    })
+            if rows:
+                _safe_show_df(pd.DataFrame(rows))
             else:
-                status = "🟡 Consistent but weak"
-            sg = ONCHAIN_INFO[c]["sign"]
-            rows.append({"Indicator": META_ALL[c][0], "Pillar": META_ALL[c][4], "Learn months": len(dl),
-                         "Rank IC (learn)": "-" if pd.isna(ic_l) else f"{ic_l:+.2f}", f"Rank IC ({unseen_lbl})": "-" if pd.isna(ic_t) else f"{ic_t:+.2f}",
-                         "HAC t (learn)": "-" if pd.isna(t_l) else f"{t_l:+.1f}", "Status": status, "Textbook sign": _SIGN_TXT_C[sg],
-                         "Matches textbook?": "n/a" if sg == 0 or pd.isna(ic_l) else ("✔" if np.sign(ic_l) == sg else "✘")})
-        show_df(st, pd.DataFrame(rows))
-        st.caption("Rank IC = rank correlation between the indicator and bitcoin's outcome (positive: higher indicator, better outcome). 'Unseen' follows the sidebar mode "
-                   "(validation only in Research mode, validation + final test when revealed). Overlapping windows mean far fewer independent observations than months, "
-                   f"and {len(_CK)} indicators are tested here, so a lone ✅ can be luck; the rules and ML tabs apply the full multiple-testing discipline. "
-                   "MVRV, its Z-score and the Mayer multiple are three views of one idea (price vs cost basis / trend) and are strongly correlated: do not count them as three votes (use factor compression in the sidebar). "
-                   "Indicators that start in 2017-18 (stablecoins, Fear & Greed, CME positioning) have too few months for a meaningful learn / unseen split.")
+                st.info("Indicator metadata is incomplete, so the readings table could not be assembled.")
 
-        # ---------------- definitions
-        with st.expander("📖 Definitions, sources and limits"):
-            show_df(st, pd.DataFrame([{"Indicator": META_ALL[c][0], "Pillar": META_ALL[c][4], "How it is built": ONCHAIN_INFO[c]["how"], "Source": ONCHAIN_INFO[c]["src"],
-                                       "First month": F_full[c].first_valid_index().strftime("%b %Y")} for c in _CK]))
-            st.markdown("""
-- **Publication lags.** On-chain values are used 2 days after the day they describe, stablecoin supply 2 days, Fear & Greed 1 day; CFTC positions from a constructed, conservative release date. Month-end values only contain what was known then.
-- **Revisions.** Coin Metrics Community data can be revised when address clustering improves. The downloaded history is the revised one, so on-chain results are somewhat flattering compared with what traders could see live. There is no free first-release vintage.
-- **Realized cap and MVRV** depend on the provider's clustering of addresses (exchange wallets, change outputs). Other providers publish different numbers.
-- **Not included.** Exchange net flows, spot-ETF flows, funding rates, open interest and long-term-holder metrics need paid feeds or have no clean free history.
-- **Regime change.** Spot ETFs (2024), corporate treasuries and futures have changed who holds bitcoin; cost-basis and cycle indicators calibrated on 2011-2021 may behave differently now.
-- **Halving cycle.** Only three completed cycles exist (2012, 2016, 2020) plus the one starting April 2024. Treat the indicator as a descriptive calendar, not as evidence.
+            # ---------------- textbook tally
+            sup = uns = neu = mix = 0
+            for c in _CK:
+                sg = _sign(c)
+                p_ = _percentile(c)
+                if sg == 0:
+                    mix += 1
+                elif not _is_num(p_):
+                    continue
+                elif (p_ >= 2 / 3 and sg > 0) or (p_ <= 1 / 3 and sg < 0):
+                    sup += 1
+                elif (p_ >= 2 / 3 and sg < 0) or (p_ <= 1 / 3 and sg > 0):
+                    uns += 1
+                else:
+                    neu += 1
+            st.markdown(
+                f"**Textbook read:** {sup} on-chain indicator(s) point in bitcoin's favor, {uns} against, "
+                f"{neu} in the middle of their range, {mix} have no clear textbook sign. "
+                "'Textbook' means the usual cycle story (low valuation vs holders' cost basis, miners recovering "
+                "and activity rising are often viewed as favorable; overheated valuation is unfavorable). "
+                "It is a checklist, not evidence: the table below shows what this sample says. Bitcoin has only "
+                "about three full historical cycles, so be skeptical of cycle rules."
+            )
+
+            # ---------------- history chart
+            st.markdown("#### History")
+            _start = globals().get("start", None)
+            pick = st.selectbox("Indicator", _CK, format_func=lambda c: str(_meta(c, 0, c)), key="chain_pick")
+            _series = pd.to_numeric(_F_FULL[pick], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            if _start is not None:
+                try:
+                    _series = _series.loc[_start:]
+                except (TypeError, KeyError, ValueError):
+                    pass
+            s_ = _series.dropna()
+            if s_.empty:
+                st.info("No history for this indicator after the chosen start date.")
+            else:
+                is_pct = bool(_meta(pick, 3, False))
+                k_ = 100.0 if is_pct else 1.0
+                f = go.Figure()
+                f.add_scatter(
+                    x=s_.index, y=s_.values * k_, mode="lines",
+                    name=str(_meta(pick, 0, pick)) + (" (%)" if is_pct else ""),
+                    line=dict(color="#1f5fbf", width=2.5),
+                )
+                if pick == "mvrv":
+                    f.add_hline(y=1.0, line_dash="dot", line_color="#2e8b57", annotation_text="1.0: price = holders' average cost")
+                _m = globals().get("m")
+                if isinstance(_m, dict) and isinstance(_m.get("btc"), pd.Series):
+                    sv = pd.to_numeric(_m["btc"], errors="coerce").reindex(s_.index)
+                    sv = sv.where(sv > 0).dropna()
+                    if not sv.empty:
+                        f.add_scatter(x=sv.index, y=sv.values, mode="lines", name="Bitcoin, USD (right axis, log)", yaxis="y2", line=dict(color="#999", width=1.5))
+                        f.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, type="log"))
+                f.update_layout(title=str(_meta(pick, 0, pick)), height=420, legend=dict(orientation="h", y=-0.2), margin=dict(t=55, b=70))
+                _safe_show_plot(f)
+                st.caption(f"**How it is built.** {_info(pick, 'how')}  \n*Source:* {_info(pick, 'src')}.")
+
+            # ---------------- link to bitcoin's outcome
+            _h = globals().get("h", "?")
+            _target_name = str(globals().get("target_name", "forward return"))
+            st.markdown(f"#### Do these indicators line up with bitcoin's {_h}-month outcome? ({_target_name.lower()})")
+            _fwd = globals().get("fwd")
+            _learn_idx = globals().get("learn_idx")
+            _unseen_idx = globals().get("unseen_idx")
+            _unseen_lbl = globals().get("unseen_lbl", "unseen")
+            _nw_t = globals().get("nw_t")
+            rows = []
+            if isinstance(_fwd, pd.Series) and _learn_idx is not None and _unseen_idx is not None:
+                for c in _CK:
+                    x_ = pd.to_numeric(_F_FULL[c], errors="coerce").reindex(_fwd.index)
+                    try:
+                        xl, yl = x_.loc[_learn_idx], _fwd.loc[_learn_idx]
+                        xt, yt = x_.loc[_unseen_idx], _fwd.loc[_unseen_idx]
+                    except (KeyError, TypeError, IndexError):
+                        continue
+                    ic_l, ic_t = _safe_rank_ic(xl, yl), _safe_rank_ic(xt, yt)
+                    dl = pd.concat([xl.rename("x"), yl.rename("y")], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+                    t_l = np.nan
+                    if len(dl) > 8 and callable(_nw_t):
+                        try:
+                            t_result = _nw_t(dl["y"].rank().values, dl["x"].rank().values, _h)
+                            t_l = float(t_result) if _is_num(t_result) else np.nan
+                        except Exception:
+                            t_l = np.nan
+                    same = bool(_is_num(ic_l) and _is_num(ic_t) and np.sign(ic_l) == np.sign(ic_t))
+                    if not _is_num(ic_l) or not _is_num(ic_t):
+                        status = "—"
+                    elif not same:
+                        status = "❌ Flips on unseen data"
+                    elif _is_num(t_l) and abs(t_l) >= 2:
+                        status = "✅ Consistent and significant"
+                    else:
+                        status = "🟡 Consistent but weak"
+                    sg = _sign(c)
+                    rows.append({
+                        "Indicator": _meta(c, 0, c),
+                        "Pillar": _meta(c, 4, "Unknown"),
+                        "Learn months": len(dl),
+                        "Rank IC (learn)": "—" if not _is_num(ic_l) else f"{ic_l:+.2f}",
+                        f"Rank IC ({_unseen_lbl})": "—" if not _is_num(ic_t) else f"{ic_t:+.2f}",
+                        "HAC t (learn)": "—" if not _is_num(t_l) else f"{t_l:+.1f}",
+                        "Status": status,
+                        "Textbook sign": _SIGN_TXT_C[sg],
+                        "Matches textbook?": "n/a" if sg == 0 or not _is_num(ic_l) else ("✔" if np.sign(ic_l) == sg else "✘"),
+                    })
+            if rows:
+                _safe_show_df(pd.DataFrame(rows))
+            else:
+                st.info("The forward-outcome sample or train/unseen split is unavailable, so this comparison cannot be calculated.")
+            st.caption(
+                "Rank IC is the rank correlation between an indicator and bitcoin's outcome (positive means higher indicator values "
+                "are associated with better outcomes in the tested sample). 'Unseen' follows the sidebar mode. Overlapping windows "
+                "mean there are far fewer independent observations than months, and multiple indicators are tested, so a lone positive "
+                "result may be luck. MVRV, its Z-score and the Mayer multiple are correlated views of valuation/trend and should not be "
+                "counted as three independent votes; use factor compression. Indicators with short histories (such as stablecoins, Fear & "
+                "Greed and CME positioning) may not support a meaningful train/unseen split."
+            )
+
+            # ---------------- definitions
+            with st.expander("📖 Definitions, sources and limits"):
+                _defs = []
+                for c in _CK:
+                    _defs.append({
+                        "Indicator": _meta(c, 0, c),
+                        "Pillar": _meta(c, 4, "Unknown"),
+                        "How it is built": _info(c, "how"),
+                        "Source": _info(c, "src"),
+                        "First month": _safe_first_month(_F_FULL[c]),
+                    })
+                _safe_show_df(pd.DataFrame(_defs))
+                st.markdown("""
+- **Publication lags.** On-chain values are used after a publication lag; stablecoin supply, Fear & Greed and CFTC positions have their own delays. Month-end values should only contain information assumed available by then.
+- **Revisions.** Coin Metrics Community data may be revised as address clustering improves. Downloaded history may therefore differ from the data traders saw in real time; free first-release vintages are generally unavailable.
+- **Realized cap and MVRV.** These depend on provider address clustering (including exchange wallets and change outputs); providers can report different values.
+- **Not included.** Exchange net flows, spot-ETF flows, funding rates, open interest and long-term-holder metrics may require paid feeds or may lack clean free history.
+- **Regime change.** Spot ETFs (2024), corporate treasuries and futures have changed bitcoin ownership and market structure. Cost-basis and cycle indicators calibrated on earlier periods may behave differently now.
+- **Halving cycle.** Only a few completed cycles are available. Treat the cycle as a descriptive calendar, not as statistical evidence.
 """)
