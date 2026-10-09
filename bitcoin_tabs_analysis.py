@@ -1,6 +1,10 @@
 """
 Bitcoin tabs, part 2: Regimes & analogues, Backtest, Robustness, Explorer.
 Executed by bitcoin_main.py (all config, helpers and results are available as globals).
+
+This file intentionally uses the shared global namespace established by bitcoin_main.py;
+it is not designed to run as a standalone Streamlit entry point. Defensive checks below
+handle empty or sparse optional results without changing the upstream public contracts.
 """
 import math
 
@@ -11,7 +15,9 @@ import streamlit as st
 
 # ------------------------------------------------------------------ regimes & analogues
 with T["reg"]:
-    if reg is None:
+    # A non-None but empty regime series is possible when selected macro inputs
+    # have no overlapping observations. Treat it like a missing regime.
+    if reg is None or reg.dropna().empty:
         st.info("Regime classification needs at least one growth indicator (copper, industrial production, Philly Fed, Sahm) and one inflation indicator (CPI, breakevens, oil).")
     else:
         st.subheader("Growth × inflation regimes")
@@ -19,8 +25,12 @@ with T["reg"]:
                    "(z-scores from the learn period). Stocks are not used: they measure risk appetite, not growth. Descriptive over all months with known outcomes.")
         rs = summarize(fwd, reg, ev_r, h, fdd, order=REGIMES)
         show_df(st, fmt_summary(rs, True))
-        st.markdown(f"**Today:** {reg.iloc[-1]}")
-        tr_df, tr_cur, _ = regime_transitions(reg, fwd, ev_r)
+        _reg_now = reg.dropna()
+        if not _reg_now.empty:
+            st.markdown(f"**Latest observed regime ({_reg_now.index[-1]:%b %Y}):** {_reg_now.iloc[-1]}")
+        else:
+            st.info("No dated regime observation is available.")
+        tr_df, tr_cur, _ = regime_transitions(reg.dropna(), fwd, ev_r)
         st.markdown("**Regime transitions** (regime 3 months ago → regime now, only months where it changed; overlapping windows, so treat n as optimistic)")
         if tr_cur:
             st.markdown(f"Current transition: **{tr_cur}**")
@@ -34,10 +44,16 @@ with T["reg"]:
     st.subheader("10 most similar historical environments (descriptive, not tradable)")
     st.caption("Closest months by standardized distance across all selected indicators (at least h months apart). Closeness is relative to the typical distance in history. "
                "This searches the whole available history, so it describes the past; it is NOT a backtest of the method and NOT a tradable signal (see the predictive test below).")
-    show_df(st, pd.DataFrame({"Date": ana["Date"], "Closeness": ana["Closeness"].map(lambda v: f"{v:.0f}%"),
-                              f"Outcome after {h}m": ana["After"].map(pc)}))
-    ser_path = (m["btc"] / m["gold"]) if target == "gold" else m["btc"]
-    paths = analogue_paths(ser_path, ana["dt"], h)
+    _ana_show = ana.copy() if isinstance(ana, pd.DataFrame) else pd.DataFrame()
+    if _ana_show.empty:
+        show_df(st, pd.DataFrame(columns=["Date", "Closeness", f"Outcome after {h}m"]))
+    else:
+        show_df(st, pd.DataFrame({"Date": _ana_show["Date"],
+                                  "Closeness": _ana_show["Closeness"].map(
+                                      lambda v: f"{v:.0f}%" if pd.notna(v) else "—"),
+                                  f"Outcome after {h}m": _ana_show["After"].map(pc)}))
+    ser_path = (m["btc"] / m["gold"].replace(0, np.nan)) if target == "gold" else m["btc"]
+    paths = analogue_paths(ser_path, _ana_show["dt"] if "dt" in _ana_show else pd.Series(dtype="datetime64[ns]"), h)
     if not paths.empty:
         pf_ = go.Figure()
         for c in paths.columns:
@@ -51,7 +67,7 @@ with T["reg"]:
     st.caption(f"For every {unseen_lbl} month the method looks for the {ANA_K} closest past months among months whose outcome was already known at that time "
                f"(standardised with that database only). Favorable = median outcome of the analogues is positive and at least 60% were positive; "
                f"Unfavorable = median not positive and at most 40% positive. This is the fair, tradable version of the descriptive table above, and it is available as a backtest signal.")
-    if wa.empty:
+    if not isinstance(wa, pd.DataFrame) or wa.empty or "med" not in wa:
         st.info("Not enough history for the predictive analogue test.")
     else:
         ev_a = unseen_idx.intersection(wa.index)
@@ -95,11 +111,20 @@ with T["bt"]:
     bt_all = None
     for v_ in src.values():
         bt_all = v_.index if bt_all is None else bt_all.intersection(v_.index)
-    okn = (nxt(m[sk]).notna() & nxt(m[gk]).notna()).reindex(bt_all).fillna(False).values.astype(bool)
-    bt_all = bt_all[(bt_all >= val_idx[0]) & okn]
-    if not REVEAL:
-        bt_all = bt_all[bt_all < test_idx[0]]  # research mode: the final test period is not even simulated
-    val_bt, test_bt = bt_all[bt_all < test_idx[0]], bt_all[bt_all >= test_idx[0]]
+    if bt_all is None or len(bt_all) == 0 or len(val_idx) == 0:
+        bt_all = pd.Index([])
+    else:
+        okn = (nxt(m[sk]).notna() & nxt(m[gk]).notna()).reindex(bt_all).fillna(False).values.astype(bool)
+        bt_all = bt_all[(bt_all >= val_idx[0]) & okn]
+    if len(test_idx):
+        if not REVEAL:
+            bt_all = bt_all[bt_all < test_idx[0]]  # research mode: the final test period is not even simulated
+    else:
+        bt_all = pd.Index([])
+    if len(test_idx):
+        val_bt, test_bt = bt_all[bt_all < test_idx[0]], bt_all[bt_all >= test_idx[0]]
+    else:
+        val_bt, test_bt = bt_all, pd.Index([])
     src = {k: v_.loc[bt_all] for k, v_ in src.items()}
     px_s = m["btc"]
     aux = pd.DataFrame({"trend": (px_s > px_s.rolling(10).mean()), "vol": px_s.pct_change().rolling(12).std() * np.sqrt(12)}).reindex(bt_all)
@@ -389,11 +414,16 @@ with T["rob"]:
 
     st.subheader("Redundancy between indicators" + (" (after factor compression)" if fac_mode else ""))
     cm = F_ok.corr(method="spearman")
-    cf_ = go.Figure(go.Heatmap(z=cm.values, x=[META[c][0] for c in cm.columns], y=[META[c][0] for c in cm.index], zmin=-1, zmax=1,
-                               colorscale="RdBu", reversescale=True, showscale=True))
-    cf_.update_layout(height=max(480, 30 * len(cm)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
-    show_plot(st, cf_)
-    pairs_hi = [(cm.index[i], cm.columns[j], cm.iloc[i, j]) for i in range(len(cm)) for j in range(i + 1, len(cm)) if abs(cm.iloc[i, j]) >= 0.8]
+    if cm.empty:
+        st.info("No usable indicator columns are available for the correlation view.")
+        pairs_hi = []
+    else:
+        cf_ = go.Figure(go.Heatmap(z=cm.values, x=[META[c][0] for c in cm.columns], y=[META[c][0] for c in cm.index], zmin=-1, zmax=1,
+                                   colorscale="RdBu", reversescale=True, showscale=True))
+        cf_.update_layout(height=max(480, 30 * len(cm)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
+        show_plot(st, cf_)
+        pairs_hi = [(cm.index[i], cm.columns[j], cm.iloc[i, j]) for i in range(len(cm)) for j in range(i + 1, len(cm))
+                    if pd.notna(cm.iloc[i, j]) and abs(cm.iloc[i, j]) >= 0.8]
     if pairs_hi:
         st.markdown("**Highly overlapping pairs (|rank correlation| ≥ 0.8)** — they vote twice for the same story (tick factor compression in the sidebar to merge them):")
         st.markdown("\n".join(f"- {META[a][0]} ↔ {META[b][0]} ({r:+.2f})" for a, b, r in sorted(pairs_hi, key=lambda x: -abs(x[2]))))
@@ -407,10 +437,18 @@ with T["exp"]:
     e1, e2 = st.columns(2)
     ind_x = e1.selectbox("Indicator", list(META), format_func=lambda c: META[c][0], key="exp_ind")
     st_x = e2.selectbox("State", STATES, format_func=lambda s_: state_label(ind_x, s_), key="exp_state")
-    allowed = S.index if REVEAL else S.index[S.index <= test_idx[0] - pd.DateOffset(months=12)]
-    sel_idx = S.index[(S[ind_x] == st_x).fillna(False).values].intersection(allowed)
-    st.markdown(f"**{len(sel_idx)} months** in this state ({len(sel_idx) / len(S):.0%} of history). "
-                f"Now: **{state_label(ind_x, S.loc[now, ind_x])}** (value {fmt_val(ind_x, F_ok.loc[now, ind_x])}).")
+    if len(S) == 0:
+        allowed = pd.Index([])
+        sel_idx = pd.Index([])
+        st.info("No historical observations are available for the selected indicator.")
+    else:
+        allowed = S.index if REVEAL or not len(test_idx) else S.index[S.index <= test_idx[0] - pd.DateOffset(months=12)]
+        sel_idx = S.index[(S[ind_x] == st_x).fillna(False).values].intersection(allowed)
+        share = len(sel_idx) / len(S) if len(S) else 0.0
+        _now_value = S.loc[now, ind_x] if now in S.index else S[ind_x].dropna().iloc[-1] if S[ind_x].notna().any() else np.nan
+        _now_fmt = fmt_val(ind_x, F_ok.loc[now, ind_x]) if now in F_ok.index else "not available"
+        st.markdown(f"**{len(sel_idx)} months** in this state ({share:.0%} of history). "
+                    f"Latest available: **{state_label(ind_x, _now_value)}** (value {_now_fmt}).")
     rows = []
     for h_ in (1, 3, 6, 12):
         row = {"Horizon": f"{h_} months"}
