@@ -1,6 +1,10 @@
 """
 Bitcoin tabs, part 1: Dashboard, Guide, Environments, Indicator ranking, Out-of-sample.
 Executed by bitcoin_main.py (all config, helpers and results are available as globals).
+
+This module intentionally relies on the shared globals created by bitcoin_main.py.
+It adds defensive checks around sparse samples and optional results, but it does not
+change the research design or claim that the underlying models are validated.
 """
 import math
 
@@ -9,23 +13,59 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+
+# Small local guards: avoid turning an unavailable estimate into a misleading value.
+def _finite(value):
+    try:
+        return bool(pd.notna(value) and np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _fmt_pct(value, digits=1):
+    return f"{float(value):+.{digits}%}" if _finite(value) else "—"
+
+
+def _safe_index_label(index, position=0):
+    try:
+        return pd.Timestamp(index[position]).strftime("%b %Y")
+    except (IndexError, TypeError, ValueError):
+        return "unavailable"
+
+
+def _safe_rows(df, columns=None):
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(columns=columns or [])
+    if df.empty:
+        return pd.DataFrame(columns=columns or df.columns)
+    return df
+
+
 # ------------------------------------------------------------------ dashboard
 with T["dash"]:
-    st.subheader(f"{ICON[v_now]} Historically {v_now.lower()} environment for bitcoin ({now:%b %Y})")
+    st.subheader(f"{ICON.get(v_now, '⚪')} Historically {str(v_now).lower()} environment for bitcoin ({now:%b %Y})")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Macro score (rules)", f"{sc_now:+.1f}" if cfg[3] != "equal" else f"{sc_now:+.0f}")
     if run_ml:
-        c2.metric(f"ML: chance {tgt_txt} in {h}m", f"{ml_p:.0%}", f"{(ml_p - ml_base) * 100:+.1f} pts vs normal ({ml_base:.0%})")
-    c3.metric("Suggested exposure", f"{expo_now:.0%}", help="Share of your INTENDED bitcoin allocation, not of your portfolio.")
+        if _finite(ml_p):
+            delta_ml = f"{(ml_p - ml_base) * 100:+.1f} pts vs normal ({ml_base:.0%})" if _finite(ml_base) else None
+            c2.metric(f"ML: chance {tgt_txt} in {h}m", f"{ml_p:.0%}", delta_ml)
+        else:
+            c2.metric(f"ML: chance {tgt_txt} in {h}m", "—", "Model estimate unavailable")
+    c3.metric("Suggested exposure", f"{expo_now:.0%}" if _finite(expo_now) else "—",
+              help="Share of your INTENDED bitcoin allocation, not of your portfolio.")
     if "mvrv" in F_all and pd.notna(F_all["mvrv"].get(now, np.nan)):
         c4.metric("MVRV (market cap / realized cap)", f"{F_all['mvrv'][now]:.2f}",
                   help="On-chain valuation: the price relative to the average price at which coins last moved. Not an intrinsic valuation, and not a timing signal by itself.")
+    else:
+        c4.metric("MVRV (market cap / realized cap)", "—", help="Unavailable for the selected month.")
 
     r_ = NOW["ret"]
-    st.markdown(f"**Bitcoin overall:** {r_['icon']} {r_['label']} | **Confidence: {r_['conf']}** "
-                f"({r_['agree']} of {r_['n_votes']} evidence channels agree; evidence on unseen data: {r_['ev_level']}). "
-                + " · ".join(f"{k} {VICON[v]}" for k, v in r_["votes"].items())
-                + "  (macro models = " + ", ".join(f"{k} {VICON[v]}" for k, v in r_["comps"].items()) + ", all reading the same indicators)")
+    vote_text = " · ".join(f"{k} {VICON.get(v, '—')}" for k, v in r_.get("votes", {}).items())
+    comp_text = ", ".join(f"{k} {VICON.get(v, '—')}" for k, v in r_.get("comps", {}).items())
+    st.markdown(f"**Bitcoin overall:** {r_.get('icon', '⚪')} {r_.get('label', 'Unavailable')} | **Confidence: {r_.get('conf', 'Unavailable')}** "
+                f"({r_.get('agree', 0)} of {r_.get('n_votes', 0)} evidence channels agree; evidence on unseen data: {r_.get('ev_level', 'Unavailable')}). "
+                + vote_text + "  (macro models = " + comp_text + ", all reading the same indicators)")
     st.caption("Exposure = average of the rules and ML views (Favorable 100%, Neutral 50%, Unfavorable 0%) as a share of the bitcoin allocation you already intended. "
                "The last tab compares bitcoin, gold and bitcoin-vs-gold side by side.")
 
@@ -37,26 +77,35 @@ with T["dash"]:
         for pl in PILLARS:
             cols = [c for c in META if META[c][4] == pl]
             if cols:
-                sc = 100 * (sum((c, S_now[c]) in good for c in cols) - sum((c, S_now[c]) in bad for c in cols)) / len(cols)
+                valid_cols = [c for c in cols if c in S_now.index]
+                if not valid_cols:
+                    continue
+                sc = 100 * (sum((c, S_now[c]) in good for c in valid_cols) - sum((c, S_now[c]) in bad for c in valid_cols)) / len(valid_cols)
                 psc[pl] = sc
-                rows.append({"Pillar": pl, "Score": f"{'🟢' if sc > 15 else ('🔴' if sc < -15 else '🟡')} {sc:+.0f}", "Indicators": len(cols)})
-        show_df(st, pd.DataFrame(rows))
+                rows.append({"Pillar": pl, "Score": f"{'🟢' if sc > 15 else ('🔴' if sc < -15 else '🟡')} {sc:+.0f}", "Indicators": len(valid_cols)})
+        show_df(st, pd.DataFrame(rows, columns=["Pillar", "Score", "Indicators"]))
         mon = [psc[p] for p in MONETARY_PILLARS if p in psc]
         ind = [psc[p] for p in INDUSTRIAL_PILLARS if p in psc]
         if mon and ind:
             st.markdown(f"**Bitcoin's two backdrops:** macro and liquidity **{np.mean(mon):+.0f}** (rates, dollar, M2, Fed liquidity, growth and risk appetite) · "
                         f"on-chain **{np.mean(ind):+.0f}** (valuation vs holders' cost basis, miners, network activity).")
-        if reg is not None:
+        if reg is not None and len(reg.dropna()):
             st.markdown(f"**Macro regime:** {reg.iloc[-1]}")
         cur, n_cur, med, n_h, avg_h = streak
-        st.markdown(f"**Persistence:** {cur.lower()} for **{n_cur}** month(s) (typical run: {med:.0f}). "
-                    + (f"After 3+ months in this state, the average outcome was {avg_h:+.1%} ({n_h} months)." if n_h >= 5 else ""))
+        persistence = f"**Persistence:** {str(cur).lower()} for **{n_cur}** month(s) (typical run: {med:.0f}). "
+        if n_h >= 5 and _finite(avg_h):
+            persistence += f"After 3+ months in this state, the average outcome was {avg_h:+.1%} ({n_h} months)."
+        st.markdown(persistence)
     with cr:
         st.markdown(f"**10 most similar past environments (descriptive, NOT tradable)** → outcome after {h} months ({target_name.lower()})")
-        a = ana["After"]
+        a = ana["After"] if isinstance(ana, dict) and "After" in ana else pd.Series(dtype=float)
+        a = pd.to_numeric(a, errors="coerce").dropna()
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Median", pc(a.median())); k2.metric("Average", pc(a.mean())); k3.metric("Positive", f"{(a > 0).mean():.0%}")
-        k4.metric("Worst", pc(a.min())); k5.metric("Best", pc(a.max()))
+        k1.metric("Median", pc(a.median()) if len(a) else "—")
+        k2.metric("Average", pc(a.mean()) if len(a) else "—")
+        k3.metric("Positive", f"{(a > 0).mean():.0%}" if len(a) else "—")
+        k4.metric("Worst", pc(a.min()) if len(a) else "—")
+        k5.metric("Best", pc(a.max()) if len(a) else "—")
         st.caption("Only 10 observations: indicative, not statistical proof. Descriptive: the search uses all history available" + ("" if REVEAL else " (final test excluded in research mode)")
                    + ". It is not a trading signal. The Regimes & analogues tab has a fair, expanding-database (tradable) version of this test.")
 
@@ -65,13 +114,13 @@ with T["dash"]:
         rows = []
         for dct, eff in ((good, "helps"), (bad, "hurts")):
             for c, s_ in sorted(dct):
-                if S_now[c] != s_:
+                if c not in S_now.index or S_now[c] != s_ or c not in th.index:
                     continue
                 lo_, hi_ = th.loc[c].iloc[0], th.loc[c].iloc[1]
                 flips = {"Low": f"rises above {fmt_val(c, lo_)}", "High": f"falls below {fmt_val(c, hi_)}",
-                         "Mid": f"leaves {fmt_val(c, lo_)} to {fmt_val(c, hi_)}"}[s_]
+                         "Mid": f"leaves {fmt_val(c, lo_)} to {fmt_val(c, hi_)}"}.get(s_, "changes state")
                 rows.append({"Indicator": META[c][0], "Now": state_label(c, s_), "Effect on verdict": eff,
-                             "Current value": fmt_val(c, F_ok.loc[now, c]), "Stops counting if it": flips})
+                             "Current value": fmt_val(c, F_ok.loc[now, c]) if c in F_ok and now in F_ok.index else "—", "Stops counting if it": flips})
         if rows:
             show_df(st, pd.DataFrame(rows))
             st.caption("Thresholds are the Low/High cut-offs used by the rules" + (" (approximated by the full history to date in point-in-time mode)." if pit else " (learn-period terciles).")
@@ -86,7 +135,7 @@ with T["dash"]:
 with T["guide"]:
     st.markdown(f"""
 ### How this works
-- **Three periods.** History is split into LEARN ({learn_idx[0]:%b %Y}–{learn_idx[-1]:%b %Y}), VALIDATION ({val_idx[0]:%b %Y}–{val_idx[-1]:%b %Y}) and FINAL TEST ({test_idx[0]:%b %Y}–{test_idx[-1]:%b %Y}).
+- **Three periods.** History is split into LEARN ({_safe_index_label(learn_idx, 0)}–{_safe_index_label(learn_idx, -1)}), VALIDATION ({_safe_index_label(val_idx, 0)}–{_safe_index_label(val_idx, -1)}) and FINAL TEST ({_safe_index_label(test_idx, 0)}–{_safe_index_label(test_idx, -1)}).
   The selection hierarchy is explicit: indicators, factors, rules and the look-ahead are chosen on LEARN only; strategy and signal are chosen on VALIDATION; the FINAL TEST only grades the locked choice.
   Outcome windows are purged so periods never overlap.
 - **What is predicted.** Raw bitcoin return, a **volatility-scaled forward return** (each outcome scaled by trailing volatility, so crisis years do not dominate), a **drawdown** target in two forms
@@ -154,14 +203,15 @@ with T["env"]:
     for c in META:
         zr, tr = [], []
         for s_ in STATES:
-            r = stats[(stats["col"] == c) & (stats["state"] == s_)]
-            if r.empty:
+            r = stats[(stats["col"] == c) & (stats["state"] == s_)] if isinstance(stats, pd.DataFrame) and not stats.empty else pd.DataFrame()
+            if r.empty or not _finite(r["avg"].iloc[0]):
                 zr.append(np.nan); tr.append("")
             else:
                 zr.append(r["avg"].iloc[0] * 100)
                 tr.append(f"{state_label(c, s_)}<br><b>{r['avg'].iloc[0]:+.1%}</b> (n={int(r['n'].iloc[0])})")
         z.append(zr); txt.append(tr)
-    zmax = np.nanmax(np.abs(z)) if np.isfinite(z).any() else 10
+    zarr = np.asarray(z, dtype=float) if z else np.empty((0, len(STATES)))
+    zmax = np.nanmax(np.abs(zarr)) if zarr.size and np.isfinite(zarr).any() else 10
     fig = go.Figure(go.Heatmap(z=z, x=["Low", "Neutral", "High"], y=[META[c][0] for c in META], text=txt, texttemplate="%{text}",
                                colorscale="RdYlGn", zmid=0, zmin=-zmax, zmax=zmax, showscale=False, xgap=3, ygap=3))
     fig.update_layout(height=max(420, 52 * len(META)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
@@ -169,17 +219,19 @@ with T["env"]:
     show_plot(st, fig)
 
     def rank_table(df):
+        df = _safe_rows(df)
         return pd.DataFrame({
             "Environment": [state_label(r.col, r.state) for r in df.itertuples()],
             "Indicator": [META[r.col][0] for r in df.itertuples()], "Months": df["n"].values,
-            "Avg after": [pc(v) for v in df["avg"]], "vs. average": [f"{v * 100:+.1f} pts" for v in df["edge"]],
-            "% positive": [pc(v, False) for v in df["win"]], "HAC t": [f"{v:+.1f}" for v in df["t"]],
-            "FDR q": [f"{v:.2f}" for v in df["q"]], "Both halves?": ["✅" if v else "❌" for v in df["consistent"]]})
+            "Avg after": [pc(v) for v in df["avg"]], "vs. average": [f"{v * 100:+.1f} pts" if _finite(v) else "—" for v in df["edge"]],
+            "% positive": [pc(v, False) for v in df["win"]], "HAC t": [f"{v:+.1f}" if _finite(v) else "—" for v in df["t"]],
+            "FDR q": [f"{v:.2f}" if _finite(v) else "—" for v in df["q"]], "Both halves?": ["✅" if v else "❌" for v in df["consistent"]]})
 
     cL, cR = st.columns(2)
-    cL.subheader("🟢 Most favorable"); show_df(cL, rank_table(stats.sort_values("edge", ascending=False).head(6)))
-    cR.subheader("🔴 Most unfavorable"); show_df(cR, rank_table(stats.sort_values("edge").head(6)))
-    st.caption(f"HAC t above ±2 is fairly strong. {len(stats)} environments are tested, so some look good by luck: the FDR q column adjusts for that "
+    cL.subheader("🟢 Most favorable"); show_df(cL, rank_table(stats.sort_values("edge", ascending=False).head(6)) if isinstance(stats, pd.DataFrame) and not stats.empty else pd.DataFrame())
+    cR.subheader("🔴 Most unfavorable"); show_df(cR, rank_table(stats.sort_values("edge").head(6)) if isinstance(stats, pd.DataFrame) and not stats.empty else pd.DataFrame())
+    n_stats = len(stats) if isinstance(stats, pd.DataFrame) else 0
+    st.caption(f"HAC t above ±2 is fairly strong. {n_stats} environments are tested, so some look good by luck: the FDR q column adjusts for that "
                f"(q below 0.10 means roughly 10% of such findings would be false). Rules in use: {len(good)} favorable, {len(bad)} unfavorable.")
     if good or bad:
         c1, c2 = st.columns(2)
@@ -190,68 +242,72 @@ with T["env"]:
 with T["rank"]:
     st.subheader("Which indicators predict best?")
     st.caption(f"Target: **{target_name}** over **{h} months**. Each indicator is compared with the outcome that followed, "
-               f"first on the learning period ({learn_idx[0]:%b %Y} to {learn_idx[-1]:%b %Y}), then on data it has never seen "
-               f"({unseen_idx[0]:%b %Y} to {unseen_idx[-1]:%b %Y}, {unseen_lbl}). Ranking is by the smaller of the two correlations, and 0 if the direction flips.")
+               f"first on the learning period ({_safe_index_label(learn_idx, 0)} to {_safe_index_label(learn_idx, -1)}), then on data it has never seen "
+               f"({_safe_index_label(unseen_idx, 0)} to {_safe_index_label(unseen_idx, -1)}, {unseen_lbl}). Ranking is by the smaller of the two correlations, and 0 if the direction flips.")
     rk = indicator_ranking(F_ok, fwd, S, learn_idx, unseen_idx, h, fdd)
+    rk = rk if isinstance(rk, pd.DataFrame) else pd.DataFrame()
     ab = ablation(F_ok, fwd, h, sp["cut"], step, unseen_idx.values).set_index("col")
-    top = rk[rk["minic"] > 0].head(3)
+    top = rk[rk["minic"] > 0].head(3) if not rk.empty and "minic" in rk else pd.DataFrame()
     if len(top):
         st.success("Most consistent so far: " + ", ".join(f"**{META[r.col][0]}** ({r.minic:.0f}%)" for r in top.itertuples()))
     else:
         st.warning("No indicator kept the same direction on unseen data. Treat every single indicator here as unreliable for this target and look-ahead.")
 
-    show_df(st, pd.DataFrame({
-        "#": range(1, len(rk) + 1),
-        "Indicator": [META[c][0] for c in rk["col"]],
-        "Pillar": [META[c][4] for c in rk["col"]],
-        "Direction": ["-" if pd.isna(v) else ("Higher → better outcome" if v > 0 else "Higher → worse outcome") for v in rk["ic_l"]],
-        "Learn corr": [pc(v) for v in rk["ic_l"]],
-        "Unseen corr": [pc(v) for v in rk["ic_t"]],
-        "Same direction?": ["✅" if v else "❌" for v in rk["same"]],
-        "Min |corr|": [f"{v:.0f}%" for v in rk["minic"]],
-        "HAC t (learn)": ["-" if pd.isna(v) else f"{v:+.1f}" for v in rk["t_l"]],
-        "Hit rate (unseen) ±95%": ["-" if pd.isna(a) else f"{a:.0%} ± {b * 100:.0f}" for a, b in zip(rk["hit"], rk["hit_ci"])],
-        "High − Low (learn)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_l"]],
-        "High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_t"]],
-        "High − Low in σ (learn)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_l"]],
-        "High − Low in σ (unseen)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_t"]],
-        "Drawdown after High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.0f} pts" for v in rk["dd_t"]],
-        "ΔAUC if removed": [("-" if pd.isna(ab["dauc"].get(c, np.nan)) else f"{ab['dauc'][c]:+.3f}") for c in rk["col"]],
-        "Verdict": rk["status"]}))
-    st.caption("**Corr** = rank correlation with the outcome (±10% is already useful for macro data, below ±5% is hard to tell from noise). "
-               "**Min |corr|** = the smaller of the learn and unseen correlations (0% if the sign flips). It is a consistency score, not a statistical test. "
-               "**Hit rate** = how often the learn-period direction called the above/below-median outcome on unseen data (50% = coin flip), with a 95% range that allows for overlapping windows. "
-               "**High − Low in σ** = the same High-minus-Low gap measured in standard deviations of the outcome (a risk-adjusted effect size; about 0.3σ or more is notable). "
-               "**Drawdown after High − Low** = typical worst fall over the look-ahead after High states minus after Low states (positive = milder drawdowns when the indicator is High). "
-               "**ΔAUC if removed** = how much a logistic walk-forward model loses without this indicator (positive = it adds information; differences under about 0.02 are noise). "
-               "The σ and drawdown columns are descriptive and are not used to pick rules. With this many indicators tested, a few look good by luck.")
+    if rk.empty:
+        st.info("There is not enough data to rank indicators for the current target and split.")
+    else:
+        show_df(st, pd.DataFrame({
+            "#": range(1, len(rk) + 1),
+            "Indicator": [META[c][0] for c in rk["col"]],
+            "Pillar": [META[c][4] for c in rk["col"]],
+            "Direction": ["-" if pd.isna(v) else ("Higher → better outcome" if v > 0 else "Higher → worse outcome") for v in rk["ic_l"]],
+            "Learn corr": [pc(v) for v in rk["ic_l"]],
+            "Unseen corr": [pc(v) for v in rk["ic_t"]],
+            "Same direction?": ["✅" if v else "❌" for v in rk["same"]],
+            "Min |corr|": [f"{v:.0f}%" if _finite(v) else "—" for v in rk["minic"]],
+            "HAC t (learn)": ["-" if pd.isna(v) else f"{v:+.1f}" for v in rk["t_l"]],
+            "Hit rate (unseen) ±95%": ["-" if pd.isna(a_) else f"{a_:.0%} ± {b_ * 100:.0f}" for a_, b_ in zip(rk["hit"], rk["hit_ci"])],
+            "High − Low (learn)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_l"]],
+            "High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.1f} pts" for v in rk["hl_t"]],
+            "High − Low in σ (learn)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_l"]],
+            "High − Low in σ (unseen)": ["-" if pd.isna(v) else f"{v:+.2f}σ" for v in rk["eff_t"]],
+            "Drawdown after High − Low (unseen)": ["-" if pd.isna(v) else f"{v:+.0f} pts" for v in rk["dd_t"]],
+            "ΔAUC if removed": ["-" if not isinstance(ab, pd.DataFrame) or "dauc" not in ab or not _finite(ab["dauc"].get(c, np.nan)) else f"{ab['dauc'][c]:+.3f}" for c in rk["col"]],
+            "Verdict": rk["status"]}))
+        st.caption("**Corr** = rank correlation with the outcome (±10% is already useful for macro data, below ±5% is hard to tell from noise). "
+                   "**Min |corr|** = the smaller of the learn and unseen correlations (0% if the sign flips). It is a consistency score, not a statistical test. "
+                   "**Hit rate** = how often the learn-period direction called the above/below-median outcome on unseen data (50% = coin flip), with a 95% range that allows for overlapping windows. "
+                   "**High − Low in σ** = the same High-minus-Low gap measured in standard deviations of the outcome (a risk-adjusted effect size; about 0.3σ or more is notable). "
+                   "**Drawdown after High − Low** = typical worst fall over the look-ahead after High states minus after Low states (positive = milder drawdowns when the indicator is High). "
+                   "**ΔAUC if removed** = how much a logistic walk-forward model loses without this indicator (positive = it adds information; differences under about 0.02 are noise). "
+                   "The σ and drawdown columns are descriptive and are not used to pick rules. With this many indicators tested, a few look good by luck.")
 
-    d_ = rk.dropna(subset=["ic_l"])
-    if len(d_):
-        nm = [META[c][0] for c in d_["col"]]
-        bf_ = go.Figure()
-        bf_.add_bar(y=nm, x=d_["ic_l"] * 100, name="Learn period", orientation="h")
-        bf_.add_bar(y=nm, x=d_["ic_t"] * 100, name="Unseen period", orientation="h")
-        bf_.update_layout(barmode="group", yaxis=dict(autorange="reversed"), height=max(420, 44 * len(d_)),
-                          xaxis_title="Correlation with the outcome (%)", title="Learn vs unseen correlation")
-        show_plot(st, bf_)
+        d_ = rk.dropna(subset=["ic_l"])
+        if len(d_):
+            nm = [META[c][0] for c in d_["col"]]
+            bf_ = go.Figure()
+            bf_.add_bar(y=nm, x=d_["ic_l"] * 100, name="Learn period", orientation="h")
+            bf_.add_bar(y=nm, x=d_["ic_t"] * 100, name="Unseen period", orientation="h")
+            bf_.update_layout(barmode="group", yaxis=dict(autorange="reversed"), height=max(420, 44 * len(d_)),
+                              xaxis_title="Correlation with the outcome (%)", title="Learn vs unseen correlation")
+            show_plot(st, bf_)
 
-    pill = rk.assign(Pillar=[META[c][4] for c in rk["col"]]).groupby("Pillar")["minic"].agg(["mean", "max", "count"]).sort_values("mean", ascending=False)
-    st.markdown("**Which themes carry the most consistent signal**")
-    show_df(st, pd.DataFrame({"Pillar": pill.index, "Average Min |corr|": [f"{v:.1f}%" for v in pill["mean"]],
-                              "Best indicator in pillar": [f"{v:.1f}%" for v in pill["max"]], "Indicators": pill["count"].values}))
+        pill = rk.assign(Pillar=[META[c][4] for c in rk["col"]]).groupby("Pillar")["minic"].agg(["mean", "max", "count"]).sort_values("mean", ascending=False)
+        st.markdown("**Which themes carry the most consistent signal**")
+        show_df(st, pd.DataFrame({"Pillar": pill.index, "Average Min |corr|": [f"{v:.1f}%" for v in pill["mean"]],
+                                  "Best indicator in pillar": [f"{v:.1f}%" for v in pill["max"]], "Indicators": pill["count"].values}))
 
-    st.markdown("**Signal decay: which look-ahead works best for each indicator** (learn period only)")
-    ich = ic_by_horizon(m, F_ok, target, train_frac).reindex(rk["col"])
-    zz = ich.values * 100
-    lim = max(10, np.nanmax(np.abs(zz))) if np.isfinite(zz).any() else 10
-    hm = go.Figure(go.Heatmap(z=zz, x=[f"{x}m" for x in ich.columns], y=[META[c][0] for c in ich.index],
-                              text=[[("" if np.isnan(v) else f"{v:+.0f}%") for v in row] for row in zz], texttemplate="%{text}",
-                              colorscale="RdYlGn", zmid=0, zmin=-lim, zmax=lim, showscale=False, xgap=3, ygap=3))
-    hm.update_layout(height=max(420, 36 * len(ich)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
-    show_plot(st, hm)
-    st.caption("Green = higher indicator values were followed by better outcomes, red = worse. Longer look-aheads have far fewer independent observations, "
-               "so strong-looking numbers on the right are less trustworthy.")
+        st.markdown("**Signal decay: which look-ahead works best for each indicator** (learn period only)")
+        ich = ic_by_horizon(m, F_ok, target, train_frac).reindex(rk["col"])
+        zz = ich.values * 100
+        lim = max(10, np.nanmax(np.abs(zz))) if np.isfinite(zz).any() else 10
+        hm = go.Figure(go.Heatmap(z=zz, x=[f"{x}m" for x in ich.columns], y=[META[c][0] for c in ich.index],
+                                  text=[["" if np.isnan(v) else f"{v:+.0f}%" for v in row] for row in zz], texttemplate="%{text}",
+                                  colorscale="RdYlGn", zmid=0, zmin=-lim, zmax=lim, showscale=False, xgap=3, ygap=3))
+        hm.update_layout(height=max(420, 36 * len(ich)), yaxis=dict(autorange="reversed"), margin=dict(l=10, r=10, t=10, b=10))
+        show_plot(st, hm)
+        st.caption("Green = higher indicator values were followed by better outcomes, red = worse. Longer look-aheads have far fewer independent observations, "
+                   "so strong-looking numbers on the right are less trustworthy.")
 
 # ------------------------------------------------------------------ out of sample
 with T["test"]:
@@ -260,18 +316,18 @@ with T["test"]:
     else:
         a, b = st.columns(2)
         a.subheader("Learn period (in-sample)")
-        a.caption(f"{learn_idx[0]:%b %Y} to {learn_idx[-1]:%b %Y}. Flattering by construction.")
+        a.caption(f"{_safe_index_label(learn_idx, 0)} to {_safe_index_label(learn_idx, -1)}. Flattering by construction.")
         show_df(a, fmt_summary(summarize(fwd, verdict, learn_idx, h, fdd), True))
         b.subheader("Validation period (unseen by the rules)")
-        b.caption(f"{val_idx[0]:%b %Y} to {val_idx[-1]:%b %Y}. Choices such as strategy and signal are made here.")
+        b.caption(f"{_safe_index_label(val_idx, 0)} to {_safe_index_label(val_idx, -1)}. Choices such as strategy and signal are made here.")
         show_df(b, fmt_summary(summarize(fwd, verdict, val_idx, h, fdd), True))
         tb = None
         if REVEAL:
             st.subheader("Final test ✅ (never used for any choice, if this is your first reveal)")
-            st.caption(f"{test_idx[0]:%b %Y} to {test_idx[-1]:%b %Y}.")
+            st.caption(f"{_safe_index_label(test_idx, 0)} to {_safe_index_label(test_idx, -1)}.")
             tsum = summarize(fwd, verdict, test_idx, h, fdd)
             show_df(st, fmt_summary(tsum, True))
-            bf = go.Figure(go.Bar(x=tsum["Group"], y=tsum["Avg"] * 100, marker_color=["#2e9e5b", "#9aa0a6", "#d64545", "#4a6fa5"],
+            bf = go.Figure(go.Bar(x=tsum["Group"], y=tsum["Avg"] * 100, marker_color=["#2e9e5b", "#9aa0a6", "#d64545", "#4a6fa5"][:len(tsum)],
                                   error_y=dict(type="data", symmetric=False, array=(tsum["hi"] - tsum["Avg"]) * 100,
                                                arrayminus=(tsum["Avg"] - tsum["lo"]) * 100),
                                   text=[f"{v:+.1f}%" if pd.notna(v) else "" for v in tsum["Avg"] * 100], textposition="outside"))
@@ -282,7 +338,7 @@ with T["test"]:
             st.subheader("Final test 🔒 hidden")
             st.caption("Research mode keeps the final test out of every table and chart. Use the validation results above while you experiment, then switch to Locked evaluation.")
             tb = summarize(fwd, verdict, val_idx, h, fdd).set_index("Group")
-        if tb.loc[FAV, "Months"] > 0 and tb.loc[UNF, "Months"] > 0:
+        if tb is not None and FAV in tb.index and UNF in tb.index and tb.loc[FAV, "Months"] > 0 and tb.loc[UNF, "Months"] > 0:
             sp_ = (tb.loc[FAV, "Avg"] - tb.loc[UNF, "Avg"]) * 100
             overlap = tb.loc[FAV, "lo"] <= tb.loc[UNF, "hi"]
             (st.success if sp_ > 2 and not overlap else st.warning)(
@@ -293,10 +349,11 @@ with T["test"]:
         pl.add_scatter(x=m_show.index, y=m_show["btc"], name="Bitcoin", line=dict(color="#888"))
         for g_, col in [(FAV, "#2e9e5b"), (UNF, "#d64545")]:
             ix = verdict[verdict == g_].index
-            ix = ix[ix <= m_show.index[-1]]
+            ix = ix[ix <= m_show.index[-1]] if len(m_show.index) else ix[:0]
             pl.add_scatter(x=ix, y=m_show["btc"].reindex(ix), mode="markers", name=g_, marker=dict(color=col, size=6))
-        vmark(pl, val_idx[0], "validation starts")
-        if REVEAL:
+        if len(val_idx):
+            vmark(pl, val_idx[0], "validation starts")
+        if REVEAL and len(test_idx):
             vmark(pl, test_idx[0], "final test starts")
         pl.update_layout(title="Bitcoin with macro verdicts", yaxis_type="log", height=380)
         show_plot(st, pl)
@@ -311,7 +368,7 @@ with T["test"]:
         sw = summarize(fwd, wfr["v"], ev_w, h, fdd)
         show_df(st, fmt_summary(sw, True))
         tw = sw.set_index("Group")
-        if tw.loc[FAV, "Months"] >= 3 and tw.loc[UNF, "Months"] >= 3:
+        if FAV in tw.index and UNF in tw.index and tw.loc[FAV, "Months"] >= 3 and tw.loc[UNF, "Months"] >= 3:
             spw = (tw.loc[FAV, "Avg"] - tw.loc[UNF, "Avg"]) * 100
             ovw = tw.loc[FAV, "lo"] <= tw.loc[UNF, "hi"]
             (st.success if spw > 2 and not ovw else st.warning)(
